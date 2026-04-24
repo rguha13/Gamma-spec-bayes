@@ -144,6 +144,9 @@ basis as the Bayesian analysis.
 - Random seeds are deterministic by default. Chain `c` uses
   `base_seed + 1000*c`.
 
+## Citation
+
+```bibtex
 @dataset{wubbeler2025fsa,
   author       = {Wübbeler, Gerd and Stein, Markus and Fleischhack, Holger and Röttger, Stefan and Honig, Andreas},
   title        = {Bayesian full-spectrum analysis of high-resolution gamma-ray spectra with energy scale correction and MCMC uncertainty quantification: Dataset and software},
