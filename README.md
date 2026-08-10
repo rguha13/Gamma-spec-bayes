@@ -46,7 +46,7 @@ theta_j, phi_b ~ Normal(0, 0.5^2 keV^2)
 gamma_b ~ Half-Normal(0.5)
 ```
 
-Posterior inference uses a custom Metropolis-within-Gibbs sampler. The default
+Posterior inference uses a custom Metropolis-Hastings sampler. The default
 run uses four chains of 20,000 iterations with the first 5,000 iterations of
 each chain discarded as burn-in.
 
