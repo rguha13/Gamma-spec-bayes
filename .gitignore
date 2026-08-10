@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+
+# Local environments and generated outputs
+.venv/
+venv/
+results/
+Spectra_plots/
+
+# Wübbeler et al. data files are obtained separately
+*.xlsx
+021_A_REF_main.csv
+05_Half_lives.csv
