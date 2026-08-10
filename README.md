@@ -39,7 +39,7 @@ The priors used by the final analysis are:
 
 ```text
 Z_j ~ Bernoulli(0.5)
-A_j | Z_j = 1 ~ Inverse-Gamma(alpha=2.5, beta=4500 Bq)
+A_j | Z_j = 1 ~ Inverse-Gamma(alpha=2.5, beta=1500 Bq)
 A_j | Z_j = 0 = 0
 w_j ~ Dirichlet(1, ..., 1)
 theta_j, phi_b ~ Normal(0, 0.5^2 keV^2)
