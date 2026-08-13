@@ -987,10 +987,7 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
                       f"{acc_weights[j]/n_post:>8.3f}")
         print(f"  Gamma: {(acc_gamma / n_post).round(3)}")
         print(f"  Theta: {(acc_theta / n_post).round(3)}")
-        print(
-            "  Target acceptance: A/weights/θ/γ → 0.20–0.40; "
-            "Z flips → 0.10–0.30"
-        )
+        print("  Target acceptance: A/weights/θ/γ → 0.20–0.40")
 
     return {
         "A":         samples_A[burnin:],
@@ -1302,31 +1299,115 @@ summarize(
 # =============================================================================
 # REFERENCE ACTIVITY COMPARISON — PEAKANALYSIS_G8 FROM FILE 021
 # =============================================================================
+
+
+def select_peakanalysis_g8_rows(reference_table, measurement_series_id):
+    """Select one unambiguous PeakAnalysis_G8 reference per isotope.
+
+    Some measurement series contain alternative subset-specific G8
+    determinations of the same activity. These are not additive components.
+    When file 021 explicitly marks a subset as "is not included", that subset
+    is excluded. Any remaining ambiguity raises an error rather than silently
+    summing or averaging distinct reference determinations.
+    """
+    required_columns = [
+        "MeasurementSeriesID_613", "REF_type", "Subset", "Nuclide",
+        "t_ref", "A_Bq", "uA_Bq", "REF_file", "Note",
+    ]
+    missing_columns = [
+        column for column in required_columns
+        if column not in reference_table.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "021_A_REF_main.csv is missing required columns: "
+            f"{missing_columns}."
+        )
+
+    series_id = str(measurement_series_id)
+    series_rows = reference_table.loc[
+        reference_table["MeasurementSeriesID_613"].astype(str).eq(series_id)
+    ].copy()
+    if series_rows.empty:
+        raise ValueError(
+            f"No reference rows found in 021_A_REF_main.csv for {series_id}."
+        )
+
+    g8_rows = series_rows.loc[
+        series_rows["REF_type"].astype(str).eq("PeakAnalysis_G8")
+    ].copy()
+    if g8_rows.empty:
+        raise ValueError(
+            f"No PeakAnalysis_G8 references found in 021_A_REF_main.csv "
+            f"for {series_id}."
+        )
+
+    required_values = ["Nuclide", "t_ref", "A_Bq", "uA_Bq", "REF_file"]
+    if g8_rows[required_values].isna().any().any():
+        raise ValueError(
+            f"Incomplete PeakAnalysis_G8 reference data for {series_id}."
+        )
+    g8_rows["Subset"] = g8_rows["Subset"].fillna("").astype(str).str.strip()
+    g8_rows["Nuclide"] = g8_rows["Nuclide"].astype(str).str.strip()
+    g8_rows["REF_file"] = g8_rows["REF_file"].astype(str).str.strip()
+    g8_rows["A_Bq"] = pd.to_numeric(g8_rows["A_Bq"], errors="raise")
+    g8_rows["uA_Bq"] = pd.to_numeric(g8_rows["uA_Bq"], errors="raise")
+    g8_rows["t_ref"] = pd.to_datetime(g8_rows["t_ref"], errors="raise")
+
+    if (g8_rows["Nuclide"].eq("").any() or g8_rows["REF_file"].eq("").any()):
+        raise ValueError(
+            f"Incomplete PeakAnalysis_G8 reference data for {series_id}."
+        )
+    if np.any(~np.isfinite(g8_rows["A_Bq"])) or np.any(g8_rows["A_Bq"] <= 0):
+        raise ValueError(f"Invalid PeakAnalysis_G8 activities for {series_id}.")
+    if np.any(~np.isfinite(g8_rows["uA_Bq"])) or np.any(g8_rows["uA_Bq"] < 0):
+        raise ValueError(
+            f"Invalid PeakAnalysis_G8 standard uncertainties for {series_id}."
+        )
+    if g8_rows.duplicated(["Nuclide", "Subset", "REF_file"]).any():
+        raise ValueError(
+            f"Duplicate PeakAnalysis_G8 rows found for {series_id}."
+        )
+
+    notes = series_rows["Note"].fillna("").astype(str)
+    subset_names = sorted(set(g8_rows["Subset"]) - {""})
+    excluded_subsets = {
+        subset for subset in subset_names
+        if notes.str.contains(
+            f"{subset} is not included", case=False, regex=False
+        ).any()
+    }
+
+    selected_rows = []
+    for isotope, isotope_rows in g8_rows.groupby("Nuclide", sort=False):
+        eligible = isotope_rows.loc[
+            ~isotope_rows["Subset"].isin(excluded_subsets)
+        ]
+        if len(eligible) != 1:
+            candidates = isotope_rows[
+                ["Subset", "REF_file", "A_Bq", "uA_Bq"]
+            ].to_dict("records")
+            raise ValueError(
+                f"Could not select one PeakAnalysis_G8 reference for "
+                f"{series_id}, isotope {isotope}. Candidates: {candidates}; "
+                f"subsets explicitly excluded by file 021: "
+                f"{sorted(excluded_subsets)}. Add an explicit selection to "
+                "021_A_REF_main.csv; G8 subset activities must not be summed."
+            )
+        selected_rows.append(eligible.iloc[0])
+
+    selected = pd.DataFrame(selected_rows).reset_index(drop=True)
+    if selected["Nuclide"].duplicated().any():
+        raise ValueError(
+            f"PeakAnalysis_G8 selection is not unique for {series_id}."
+        )
+    return selected, sorted(excluded_subsets)
+
+
 reference_table = pd.read_csv(base / "021_A_REF_main.csv")
-g8_rows = reference_table.loc[
-    reference_table["MeasurementSeriesID_613"].astype(str).eq(str(mix0["MSID"]))
-    & reference_table["REF_type"].astype(str).eq("PeakAnalysis_G8")
-].copy()
-
-if g8_rows.empty:
-    raise ValueError(
-        f"No PeakAnalysis_G8 references found in 021_A_REF_main.csv "
-        f"for {mix0['MSID']}."
-    )
-
-required_g8_columns = ["Nuclide", "t_ref", "A_Bq", "uA_Bq", "REF_file"]
-if g8_rows[required_g8_columns].isna().any().any():
-    raise ValueError(
-        f"Incomplete PeakAnalysis_G8 reference data for {mix0['MSID']}."
-    )
-
-g8_rows["A_Bq"] = pd.to_numeric(g8_rows["A_Bq"], errors="raise")
-g8_rows["uA_Bq"] = pd.to_numeric(g8_rows["uA_Bq"], errors="raise")
-g8_rows["t_ref"] = pd.to_datetime(g8_rows["t_ref"], errors="raise")
-if g8_rows.duplicated(["Nuclide", "Subset", "REF_file"]).any():
-    raise ValueError(
-        f"Duplicate PeakAnalysis_G8 component rows found for {mix0['MSID']}."
-    )
+g8_rows, excluded_g8_subsets = select_peakanalysis_g8_rows(
+    reference_table, mix0["MSID"]
+)
 
 reference_dates = g8_rows["t_ref"].drop_duplicates()
 if len(reference_dates) != 1:
@@ -1336,17 +1417,14 @@ if len(reference_dates) != 1:
     )
 reference_date = pd.Timestamp(reference_dates.iloc[0])
 
-# Some mixtures contain multiple physical subsets. Their activities add, and
-# the corresponding standard uncertainties are combined in quadrature.
 g8_reference = {}
-for iso, iso_rows in g8_rows.groupby("Nuclide", sort=False):
-    g8_reference[str(iso)] = {
-        "A_Bq": float(iso_rows["A_Bq"].sum()),
-        "uA_Bq": float(np.sqrt(np.sum(iso_rows["uA_Bq"].to_numpy() ** 2))),
-        "n_components": int(len(iso_rows)),
-        "reference_files": "; ".join(
-            sorted(iso_rows["REF_file"].astype(str).unique())
-        ),
+for _, row in g8_rows.iterrows():
+    iso = str(row["Nuclide"])
+    g8_reference[iso] = {
+        "A_Bq": float(row["A_Bq"]),
+        "uA_Bq": float(row["uA_Bq"]),
+        "subset": str(row["Subset"]),
+        "reference_file": str(row["REF_file"]),
     }
 
 expected_g8_isotopes = set(
@@ -1362,15 +1440,33 @@ if set(g8_reference) != expected_g8_isotopes:
     )
 
 run_filename = str(mix0["Filename"][r_run])
-run_start = pd.Timestamp(
-    spectra.loc[spectra["Filename"].astype(str) == run_filename, "t_start"].iloc[0]
-)
+run_rows = spectra.loc[spectra["Filename"].astype(str).eq(run_filename)]
+if len(run_rows) != 1:
+    raise ValueError(
+        f"Expected one spectrum row for selected run {run_filename}; "
+        f"found {len(run_rows)}."
+    )
+run_start = pd.to_datetime(run_rows["t_start"].iloc[0], errors="raise")
 elapsed_seconds_to_reference = (reference_date - run_start).total_seconds()
 
 half_lives = pd.read_csv(base / "05_Half_lives.csv")
+if half_lives["Nuclide"].astype(str).duplicated().any():
+    raise ValueError("05_Half_lives.csv contains duplicate nuclide rows.")
 half_life_seconds = dict(zip(
     half_lives["Nuclide"].astype(str), half_lives["HalfLife_s"].astype(float)
 ))
+missing_half_lives = sorted(set(g8_reference) - set(half_life_seconds))
+invalid_half_lives = sorted(
+    iso for iso in g8_reference
+    if iso in half_life_seconds and (
+        not np.isfinite(half_life_seconds[iso]) or half_life_seconds[iso] <= 0
+    )
+)
+if missing_half_lives or invalid_half_lives:
+    raise ValueError(
+        f"Invalid half-life lookup. Missing: {missing_half_lives}; "
+        f"nonpositive/nonfinite: {invalid_half_lives}."
+    )
 iso_idx = {name: i for i, name in enumerate(model_isotope_names)}
 unknown_g8_isotopes = sorted(set(g8_reference) - set(iso_idx))
 if unknown_g8_isotopes:
@@ -1383,8 +1479,16 @@ comparison_width = 93
 print(f"\n{'='*comparison_width}")
 print(f"PeakAnalysis_G8 comparison — mixture {i_mix}, run {r_run}: {run_filename}")
 print(f"G8 references loaded from 021_A_REF_main.csv for {mix0['MSID']}")
-if any(ref["n_components"] > 1 for ref in g8_reference.values()):
-    print("Multiple G8 subset activities summed; uncertainties combined in quadrature")
+selected_subsets = sorted(
+    {ref["subset"] for ref in g8_reference.values() if ref["subset"]}
+)
+if selected_subsets:
+    print(f"Selected G8 subset(s): {', '.join(selected_subsets)}")
+if excluded_g8_subsets:
+    print(
+        "Excluded G8 subset(s) marked 'is not included' in file 021: "
+        f"{', '.join(excluded_g8_subsets)}"
+    )
 print(f"Posterior activities decay-corrected from {run_start} to {reference_date}")
 print(f"{'='*comparison_width}")
 print(f"{'Isotope':<8} {'Post.Mean':>10} {'99% CI (kBq)':>22} "
@@ -1428,8 +1532,9 @@ for iso, ref in g8_reference.items():
         "Reference_type": "PeakAnalysis_G8",
         "Ref_G8_kBq": A_ref / 1e3,
         "uRef_G8_k1_kBq": uA_ref / 1e3,
-        "G8_component_count": ref["n_components"],
-        "G8_reference_files": ref["reference_files"],
+        "G8_component_count": 1,
+        "G8_subset": ref["subset"],
+        "G8_reference_files": ref["reference_file"],
         "Rel_bias_pct": rel_bias,
         "En": En,
         "Covered_99pct": covered,
