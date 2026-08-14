@@ -135,11 +135,10 @@ and the reconstructed-spectrum and posterior figures.
 
 ```bibtex
 @dataset{wubbeler2025fsa,
-  author       = {Wübbeler, Gerd and Stein, Markus and Fleischhack, Holger and Röttger, Stefan and Honig, Andreas},
-  title        = {Bayesian full-spectrum analysis of high-resolution gamma-ray spectra with energy scale correction and MCMC uncertainty quantification: Dataset and software},
-  year         = {2025},
-  publisher    = {Zenodo},
-  doi          = {10.5281/zenodo.15631392},
-  url          = {https://doi.org/10.5281/zenodo.15631392}
+  author    = {W{\"u}bbeler, Gerd and Stein, Mathias and Fleischhack, Henrike and R{\"o}ttger, Stefan and Honig, Anja},
+  title     = {Bayesian full-spectrum analysis of high-resolution gamma-ray spectra with energy scale correction and MCMC uncertainty quantification: Dataset and software},
+  year      = {2025},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.15631392}
 }
 ```
