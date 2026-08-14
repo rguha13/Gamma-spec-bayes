@@ -133,11 +133,4 @@ and the reconstructed-spectrum and posterior figures.
 
 ## Citation
 
-```bibtex
-\bibitem{wubbeler2025fsa}
-G.~W{\"u}bbeler, M.~Stein, H.~Fleischhack, S.~R{\"o}ttger, and A.~Honig,
-``Bayesian full-spectrum analysis of high-resolution gamma-ray spectra
-with energy scale correction and MCMC uncertainty quantification:
-Dataset and software,'' Zenodo, Jun. 10, 2025,
-doi: 10.5281/zenodo.15631392.
-```
+G. Wübbeler, M. Stein, H. Fleischhack, S. Röttgerand A. Honig, “Bayesian full-spectrum analysis of high-resolution gamma-ray spectra with energy scale correction and MCMC uncertainty quantification: Dataset and software”. Zenodo, Jun. 10, 2025. doi: 10.5281/zenodo.15631392.
