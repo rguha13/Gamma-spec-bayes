@@ -134,11 +134,10 @@ and the reconstructed-spectrum and posterior figures.
 ## Citation
 
 ```bibtex
-@dataset{wubbeler2025fsa,
-  author    = {W{\"u}bbeler, Gerd and Stein, Mathias and Fleischhack, Henrike and R{\"o}ttger, Stefan and Honig, Anja},
-  title     = {Bayesian full-spectrum analysis of high-resolution gamma-ray spectra with energy scale correction and MCMC uncertainty quantification: Dataset and software},
-  year      = {2025},
-  publisher = {Zenodo},
-  doi       = {10.5281/zenodo.15631392}
-}
+\bibitem{wubbeler2025fsa}
+G.~W{\"u}bbeler, M.~Stein, H.~Fleischhack, S.~R{\"o}ttger, and A.~Honig,
+``Bayesian full-spectrum analysis of high-resolution gamma-ray spectra
+with energy scale correction and MCMC uncertainty quantification:
+Dataset and software,'' Zenodo, Jun. 10, 2025,
+doi: 10.5281/zenodo.15631392.
 ```
