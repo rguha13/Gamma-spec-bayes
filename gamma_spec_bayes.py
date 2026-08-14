@@ -866,7 +866,7 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
                      step_logA, step_gamma, step_theta,
                      n_iter, burnin, seed, isotope_names=None,
                      template_names=None,
-                     alignment_names=None, verbose=True, progress_every=100):
+                     alignment_names=None, verbose=True, progress_every=1000):
 
     rng = np.random.default_rng(seed)
     K_local = len(iso_index)
@@ -970,7 +970,7 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
             F_iso_energy, F_bg_energy, iso_index, energy_template
         )
 
-        if verbose and ((it + 1) % progress_every == 0 or it == n_iter - 1):
+        if verbose and ((it + 1) %  == 0 or it == n_iter - 1):
             print(f"  Seed {seed}: iteration {it+1}/{n_iter}")
 
     n_post = n_iter - burnin
@@ -987,7 +987,6 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
                       f"{acc_weights[j]/n_post:>8.3f}")
         print(f"  Gamma: {(acc_gamma / n_post).round(3)}")
         print(f"  Theta: {(acc_theta / n_post).round(3)}")
-        print("  Target acceptance: A/weights/θ/γ → 0.20–0.40")
 
     return {
         "A":         samples_A[burnin:],
@@ -1015,7 +1014,7 @@ def run_multiple_chains(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
                         n_iter=4000, burnin=2000, n_chains=4,
                         base_seed=123, isotope_names=None,
                         template_names=None,
-                        alignment_names=None, verbose=True, progress_every=100):
+                        alignment_names=None, verbose=True, progress_every=1000):
 
     K_local = len(iso_index)
     M_local = len(F_iso_energy)
@@ -1091,7 +1090,7 @@ multi_out = run_multiple_chains(
     template_names=template_labels,
     alignment_names=alignment_labels,
     verbose=True,
-    progress_every=100
+    progress_every=1000
 )
 
 elapsed = time.time() - t_wall_start
@@ -1226,7 +1225,7 @@ for iso in active_labels:
     rhat   = float(az.rhat(idata)[var].values)
     ess_b  = float(az.ess(idata, method="bulk")[var].values)
     ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "✓ OK" if rhat < 1.01 and ess_b > 400 else "⚠ CHECK"
+    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
     print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
 
 # Isotope-specific energy shifts
@@ -1235,7 +1234,7 @@ for j in selected_idx:
     rhat   = float(az.rhat(idata)[var].values)
     ess_b  = float(az.ess(idata, method="bulk")[var].values)
     ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "✓ OK" if rhat < 1.01 and ess_b > 400 else "⚠ CHECK"
+    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
     print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
 
 # Retained-template nuisance weights
@@ -1244,7 +1243,7 @@ for m in diagnostic_weight_idx:
     rhat   = float(az.rhat(idata)[var].values)
     ess_b  = float(az.ess(idata, method="bulk")[var].values)
     ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "✓ OK" if rhat < 1.01 and ess_b > 400 else "⚠ CHECK"
+    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
     print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
 
 # Background energy shifts
@@ -1253,7 +1252,7 @@ for b in range(B):
     rhat   = float(az.rhat(idata)[var].values)
     ess_b  = float(az.ess(idata, method="bulk")[var].values)
     ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "✓ OK" if rhat < 1.01 and ess_b > 400 else "⚠ CHECK"
+    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
     print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
 
 # Background coefficients
@@ -1262,7 +1261,7 @@ for b in range(B):
     rhat   = float(az.rhat(idata)[var].values)
     ess_b  = float(az.ess(idata, method="bulk")[var].values)
     ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "✓ OK" if rhat < 1.01 and ess_b > 400 else "⚠ CHECK"
+    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
     print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
 
 print(f"\nRule: R-hat < 1.01 and ESS > 400 indicate convergence.")
