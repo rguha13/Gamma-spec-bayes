@@ -12,7 +12,7 @@ For observed channel count `Y_c` and livetime `T`, the expected count is
 Y_c ~ Poisson(mu_c)
 
 mu_c = T * [sum_j Z_j A_j sum_m w_jm X_jm(E_c + theta_j)
-            + sum_b gamma_b B_b(E_c + phi_b)]
+            + sum_b gamma_b B_b(E_c + theta_b)]
 ```
 
 where:
@@ -24,7 +24,7 @@ where:
 - `w_jm` is a nonnegative simplex weight over the retained templates of
   isotope `j`;
 - `theta_j` is an isotope-specific energy shift in keV;
-- `B_b`, `gamma_b`, and `phi_b` are the empirical background template,
+- `B_b`, `gamma_b`, and `theta_b` are the empirical background template,
   nonnegative scale, and energy shift.
 
 The isotope library contains 31 candidate template series for 11 radionuclides.
@@ -48,7 +48,8 @@ gamma_b ~ Half-Normal(0.5)
 
 Posterior inference uses a custom Metropolis-Hastings sampler. The default
 run uses four chains of 20,000 iterations with the first 5,000 iterations of
-each chain discarded as burn-in.
+each chain discarded as burn-in. The number of MCMC iterations and burn-in period may be increased
+if the sampler hasn't converged within the default configurations.
 
 ## Files
 
