@@ -15,6 +15,7 @@
 # =============================================================================
 
 import argparse
+import json
 import os
 import time
 import pandas as pd
@@ -553,7 +554,7 @@ F_bg_energy = [
 
 # Prior hyperparameters
 alpha_ig    = 2.5
-beta_ig     = 4500      # Bq; IG prior on activity (mean = 3000 Bq)
+beta_ig     = 1500      # Bq; IG prior on activity (mean = 1000 Bq)
 pi_iso_prior = 0.5
 pi = pi_iso_prior * np.ones(K)
 sigma_theta = 0.5  # keV; isotope-level and background shifts
@@ -917,9 +918,16 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
     acc_gamma = np.zeros(B_local)
     acc_theta = np.zeros(P_local)
     acc_Z     = np.zeros(K_local)
+    attempted_A = np.zeros(K_local, dtype=int)
+    attempted_weights = np.zeros(K_local, dtype=int)
+    attempted_gamma = np.zeros(B_local, dtype=int)
+    attempted_theta = np.zeros(P_local, dtype=int)
+    attempted_Z = np.zeros(K_local, dtype=int)
 
     for it in range(n_iter):
         for j in range(K_local):
+            if it >= burnin:
+                attempted_Z[j] += 1
             accepted = int(mh_flip_Z_j(
                 j, Y0, A0, weights, Gamma0, theta, Z, T0,
                 alpha_ig, beta_ig, pi, F_iso_energy, F_bg_energy,
@@ -928,36 +936,44 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
             if it >= burnin:
                 acc_Z[j] += accepted
         for j in range(K_local):
+            is_mh_attempt = Z[j] == 1 and A0[j] > 0
             accepted = int(mh_update_A_j(
                 j, Y0, A0, weights, Gamma0, theta, Z, T0,
                 alpha_ig, beta_ig, F_iso_energy, F_bg_energy, step_logA,
                 iso_index, energy_template, rng
             ))
-            if it >= burnin:
+            if it >= burnin and is_mh_attempt:
+                attempted_A[j] += 1
                 acc_A[j] += accepted
         for j in range(K_local):
+            is_mh_attempt = len(iso_index[j]) > 1 and Z[j] == 1
             accepted = int(mh_update_weights_j(
                 j, Y0, A0, weights, Gamma0, theta, Z, T0,
                 weight_dirichlet_alpha, weight_proposal_concentration,
                 F_iso_energy, F_bg_energy, iso_index, energy_template, rng
             ))
-            if it >= burnin:
+            if it >= burnin and is_mh_attempt:
+                attempted_weights[j] += 1
                 acc_weights[j] += accepted
         for b in range(B_local):
+            is_mh_attempt = Gamma0[b] > 0
             accepted = int(mh_update_Gamma_b(
                 b, Y0, A0, weights, Gamma0, theta, Z, T0, s_gamma,
                 F_iso_energy, F_bg_energy, step_gamma, iso_index,
                 energy_template, rng
             ))
-            if it >= burnin:
+            if it >= burnin and is_mh_attempt:
+                attempted_gamma[b] += 1
                 acc_gamma[b] += accepted
         for p in range(P_local):
+            is_mh_attempt = p >= K_local or Z[p] == 1
             accepted = int(mh_update_theta_p(
                 p, Y0, A0, weights, Gamma0, theta, Z, T0, sigma_theta,
                 F_iso_energy, F_bg_energy, step_theta, iso_index,
                 energy_template, rng
             ))
-            if it >= burnin:
+            if it >= burnin and is_mh_attempt:
+                attempted_theta[p] += 1
                 acc_theta[p] += accepted
 
         samples_A[it]      = A0
@@ -970,10 +986,22 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
             F_iso_energy, F_bg_energy, iso_index, energy_template
         )
 
-        if verbose and ((it + 1) %  == 0 or it == n_iter - 1):
+        if verbose and ((it + 1) % progress_every == 0 or it == n_iter - 1):
             print(f"  Seed {seed}: iteration {it+1}/{n_iter}")
 
     n_post = n_iter - burnin
+    def acceptance_rates(accepted, attempted):
+        return np.divide(
+            accepted, attempted,
+            out=np.zeros(accepted.shape, dtype=float),
+            where=attempted > 0,
+        )
+
+    rate_A = acceptance_rates(acc_A, attempted_A)
+    rate_weights = acceptance_rates(acc_weights, attempted_weights)
+    rate_gamma = acceptance_rates(acc_gamma, attempted_gamma)
+    rate_theta = acceptance_rates(acc_theta, attempted_theta)
+    rate_Z = acceptance_rates(acc_Z, attempted_Z)
     if verbose:
         print(f"\n  Acceptance rates (post burn-in, {n_post} samples):")
         if isotope_names is not None:
@@ -982,11 +1010,14 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
                 f"{'Weights':>8}"
             )
             for j, name in enumerate(isotope_names):
-                print(f"  {name:30s}  {acc_Z[j]/n_post:>8.3f}  "
-                      f"{acc_A[j]/n_post:>8.3f}  "
-                      f"{acc_weights[j]/n_post:>8.3f}")
-        print(f"  Gamma: {(acc_gamma / n_post).round(3)}")
-        print(f"  Theta: {(acc_theta / n_post).round(3)}")
+                print(f"  {name:30s}  {rate_Z[j]:>8.3f}  "
+                      f"{rate_A[j]:>8.3f}  "
+                      f"{rate_weights[j]:>8.3f}")
+        print(f"  Attempted Z: {attempted_Z}")
+        print(f"  Attempted A: {attempted_A}")
+        print(f"  Attempted weights: {attempted_weights}")
+        print(f"  Gamma: {rate_gamma.round(3)} (attempted {attempted_gamma})")
+        print(f"  Theta: {rate_theta.round(3)} (attempted {attempted_theta})")
 
     return {
         "A":         samples_A[burnin:],
@@ -995,11 +1026,16 @@ def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
         "theta":     samples_theta[burnin:],
         "Z":         samples_Z[burnin:],
         "loglik":    samples_loglik[burnin:],
-        "acc_A":     acc_A / n_post,
-        "acc_weights": acc_weights / n_post,
-        "acc_gamma": acc_gamma / n_post,
-        "acc_theta": acc_theta / n_post,
-        "acc_Z":     acc_Z / n_post,
+        "acc_A": rate_A, "accepted_A": acc_A.astype(int),
+        "attempted_A": attempted_A,
+        "acc_weights": rate_weights, "accepted_weights": acc_weights.astype(int),
+        "attempted_weights": attempted_weights,
+        "acc_gamma": rate_gamma, "accepted_gamma": acc_gamma.astype(int),
+        "attempted_gamma": attempted_gamma,
+        "acc_theta": rate_theta, "accepted_theta": acc_theta.astype(int),
+        "attempted_theta": attempted_theta,
+        "acc_Z": rate_Z, "accepted_Z": acc_Z.astype(int),
+        "attempted_Z": attempted_Z,
     }
 
 # =============================================================================
@@ -1027,6 +1063,21 @@ def run_multiple_chains(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
     chains_theta  = np.zeros((n_chains, n_keep, K_local + B_local))
     chains_Z      = np.zeros((n_chains, n_keep, K_local), dtype=int)
     chains_loglik = np.zeros((n_chains, n_keep))
+    acceptance = {
+        "A": np.zeros((n_chains, K_local)),
+        "weights": np.zeros((n_chains, K_local)),
+        "gamma": np.zeros((n_chains, B_local)),
+        "theta": np.zeros((n_chains, K_local + B_local)),
+        "Z": np.zeros((n_chains, K_local)),
+    }
+    attempted = {
+        name: np.zeros(values.shape, dtype=int)
+        for name, values in acceptance.items()
+    }
+    accepted = {
+        name: np.zeros(values.shape, dtype=int)
+        for name, values in acceptance.items()
+    }
 
     for ch in range(n_chains):
         seed = base_seed + 1000 * ch
@@ -1052,11 +1103,16 @@ def run_multiple_chains(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
         chains_theta[ch]  = out["theta"]
         chains_Z[ch]      = out["Z"]
         chains_loglik[ch] = out["loglik"]
+        for name in acceptance:
+            acceptance[name][ch] = out[f"acc_{name}"]
+            accepted[name][ch] = out[f"accepted_{name}"]
+            attempted[name][ch] = out[f"attempted_{name}"]
 
     return {
         "A": chains_A, "weights": chains_weights, "Gamma": chains_Gamma,
         "theta": chains_theta,
         "Z": chains_Z, "loglik": chains_loglik,
+        "acceptance": acceptance, "accepted": accepted, "attempted": attempted,
     }
 
 # =============================================================================
@@ -1128,6 +1184,83 @@ np.save(
 )
 np.save(save_dir / "isotope_labels.npy", model_isotope_names)
 np.save(save_dir / "alignment_labels.npy", alignment_labels)
+np.save(save_dir / "energy_grid.npy", energy_template)
+
+acceptance_output = {}
+for name in multi_out["acceptance"]:
+    acceptance_output[f"rate_{name}"] = multi_out["acceptance"][name]
+    acceptance_output[f"accepted_{name}"] = multi_out["accepted"][name]
+    acceptance_output[f"attempted_{name}"] = multi_out["attempted"][name]
+np.savez(save_dir / "acceptance_diagnostics.npz", **acceptance_output)
+
+analysis_metadata = {
+    "schema_version": 1,
+    "data": {
+        "mixture_id": str(mix0["MSID"]),
+        "mixture_index": int(i_mix),
+        "run_index": int(r_run),
+        "run_filename": str(mix0["Filename"][r_run]),
+        "live_time_s": float(T0),
+        "energy_calibration": {
+            "b0_keV": float(a_cal),
+            "b1_keV_per_channel": float(b_cal),
+        },
+        "energy_grid_file": "energy_grid.npy",
+        "channel_count": int(C),
+    },
+    "model": {
+        "isotope_labels": model_isotope_names.tolist(),
+        "template_labels": template_labels.tolist(),
+        "background_labels": background_labels.tolist(),
+        "alignment_labels": alignment_labels.tolist(),
+        "isotope_template_indices": [
+            indices.tolist() for indices in model_iso_index
+        ],
+        "dimensions": {"K": int(K), "M": int(M), "B": int(B), "P": int(P)},
+        "priors": {
+            "activity_inverse_gamma": {
+                "alpha": float(alpha_ig), "beta_Bq": float(beta_ig)
+            },
+            "isotope_inclusion_probability": float(pi_iso_prior),
+            "shift_sigma_keV": float(sigma_theta),
+            "background_half_normal_scale": s_gamma.tolist(),
+            "weight_dirichlet_alpha": float(weight_dirichlet_alpha),
+        },
+        "clustering": {
+            "similarity_energy_keV": [
+                float(similarity_energy_min), float(similarity_energy_max)
+            ],
+            "template_cosine_threshold": float(cosine_cluster_threshold),
+            "template_pearson_threshold": float(pearson_cluster_threshold),
+            "background_cosine_threshold": float(background_cosine_threshold),
+            "background_pearson_threshold": float(background_pearson_threshold),
+            "template_representative_candidate_indices": (
+                representative_candidate_idx.tolist()
+            ),
+            "background_representative_indices": (
+                background_representative_idx.tolist()
+            ),
+        },
+        "proposals": {
+            "step_log_activity": step_logA.tolist(),
+            "step_background": step_gamma.tolist(),
+            "step_shift": step_theta.tolist(),
+            "weight_dirichlet_concentration": (
+                weight_proposal_concentration.tolist()
+            ),
+        },
+    },
+    "sampler": {
+        "n_chains": int(n_chains),
+        "n_iterations": int(n_iter),
+        "burnin": int(burnin),
+        "retained_draws_per_chain": int(n_iter - burnin),
+        "base_seed": 123,
+        "progress_every": 1000,
+    },
+}
+with (save_dir / "analysis_metadata.json").open("w", encoding="utf-8") as handle:
+    json.dump(analysis_metadata, handle, indent=2)
 print(f"Chains saved to: {save_dir}")
 
 # =============================================================================

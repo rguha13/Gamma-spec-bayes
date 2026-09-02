@@ -2,10 +2,11 @@
 
 This script never runs the MCMC sampler. It reloads the selected observed
 spectrum, its fixed energy calibration, the saved representative templates,
-and the retained posterior draws written by gamma_spec_bayes_test.py.
+and the retained posterior draws written by gamma_spec_bayes.py.
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -105,6 +106,7 @@ def load_analysis_inputs(base, mixture_index, run_index):
         "run_filename": run_filename,
         "observed_counts": observed_counts,
         "live_time": live_time,
+        "run_calibration": run_calibration,
         "channels": channels,
         "energy": energy,
     }
@@ -120,6 +122,7 @@ def load_saved_posterior(result_dir):
         "template_labels.npy", "alignment_labels.npy",
         "posterior_template_weights.csv",
         "template_cosine_similarity.csv",
+        "analysis_metadata.json", "energy_grid.npy",
     ]
     missing = [name for name in required if not (result_dir / name).exists()]
     if missing:
@@ -132,6 +135,12 @@ def load_saved_posterior(result_dir):
     chains_gamma = np.load(result_dir / "chains_Gamma.npy")
     chains_theta = np.load(result_dir / "chains_theta.npy")
     chains_Z = np.load(result_dir / "chains_Z.npy")
+    chains_loglik = np.load(result_dir / "chains_loglik.npy")
+    saved_energy = np.load(result_dir / "energy_grid.npy")
+    with (result_dir / "analysis_metadata.json").open(
+        encoding="utf-8"
+    ) as handle:
+        metadata = json.load(handle)
     isotope_labels = np.load(
         result_dir / "isotope_labels.npy", allow_pickle=True
     ).astype(str)
@@ -164,6 +173,7 @@ def load_saved_posterior(result_dir):
         "chains_gamma": chains_gamma,
         "chains_theta": chains_theta,
         "chains_Z": chains_Z,
+        "chains_loglik": chains_loglik,
         "isotope_labels": isotope_labels,
         "template_labels": template_labels,
         "alignment_labels": alignment_labels,
@@ -171,14 +181,125 @@ def load_saved_posterior(result_dir):
         "backgrounds": backgrounds,
         "isotope_of_template": isotope_of_template,
         "isotope_template_indices": isotope_template_indices,
+        "saved_energy": saved_energy,
+        "metadata": metadata,
     }
 
 
-def plot_activity_prior(output_dir, show=False):
+def validate_saved_analysis(data, posterior):
+    """Reject saved results that do not match the requested run and model."""
+    metadata = posterior["metadata"]
+    if metadata.get("schema_version") != 1:
+        raise ValueError(
+            f"Unsupported analysis metadata schema: "
+            f"{metadata.get('schema_version')!r}."
+        )
+    try:
+        saved_data = metadata["data"]
+        model = metadata["model"]
+        dimensions = model["dimensions"]
+        sampler = metadata["sampler"]
+    except KeyError as error:
+        raise ValueError(
+            f"Analysis metadata is missing required field {error.args[0]!r}."
+        ) from error
+
+    identity_checks = {
+        "mixture ID": (saved_data.get("mixture_id"), data["mixture_id"]),
+        "run filename": (saved_data.get("run_filename"), data["run_filename"]),
+    }
+    for label, (saved, requested) in identity_checks.items():
+        if str(saved) != str(requested):
+            raise ValueError(
+                f"Saved {label} {saved!r} does not match requested "
+                f"{label} {requested!r}."
+            )
+
+    saved_calibration = np.array([
+        saved_data["energy_calibration"]["b0_keV"],
+        saved_data["energy_calibration"]["b1_keV_per_channel"],
+    ], dtype=float)
+    if not np.allclose(
+        saved_calibration, data["run_calibration"], rtol=0.0, atol=1e-12
+    ):
+        raise ValueError(
+            "Saved energy calibration does not match the requested run: "
+            f"saved={saved_calibration.tolist()}, "
+            f"requested={data['run_calibration'].tolist()}."
+        )
+    if (
+        posterior["saved_energy"].shape != data["energy"].shape
+        or not np.allclose(
+            posterior["saved_energy"], data["energy"], rtol=0.0, atol=1e-10
+        )
+    ):
+        raise ValueError("Saved energy grid does not match the requested run.")
+
+    K, M, B, P = (
+        int(dimensions[name]) for name in ("K", "M", "B", "P")
+    )
+    if P != K + B:
+        raise ValueError("Saved model configuration has inconsistent dimensions.")
+    required_model_sections = {"priors", "clustering", "proposals"}
+    missing_sections = sorted(required_model_sections - set(model))
+    if missing_sections:
+        raise ValueError(
+            f"Saved model configuration is missing sections: {missing_sections}."
+        )
+    configured_backgrounds = model.get("background_labels")
+    if configured_backgrounds != posterior["alignment_labels"][K:].tolist():
+        raise ValueError(
+            "Saved background labels do not match the alignment configuration."
+        )
+    label_dimensions = {
+        "isotope_labels": K, "template_labels": M, "alignment_labels": P,
+    }
+    for name, expected_length in label_dimensions.items():
+        if len(posterior[name]) != expected_length:
+            raise ValueError(
+                f"Saved {name} length {len(posterior[name])} does not match "
+                f"model configuration {expected_length}."
+            )
+    expected_labels = {
+        "isotope_labels": posterior["isotope_labels"].tolist(),
+        "template_labels": posterior["template_labels"].tolist(),
+        "alignment_labels": posterior["alignment_labels"].tolist(),
+    }
+    for name, artifact_labels in expected_labels.items():
+        if model.get(name) != artifact_labels:
+            raise ValueError(
+                f"Saved model configuration does not match {name}."
+            )
+    if model.get("isotope_template_indices") != [
+        indices.tolist() for indices in posterior["isotope_template_indices"]
+    ]:
+        raise ValueError(
+            "Saved model configuration does not match template-weight metadata."
+        )
+
+    n_chains = int(sampler["n_chains"])
+    n_draws = int(sampler["retained_draws_per_chain"])
+    expected_shapes = {
+        "chains_A": (n_chains, n_draws, K),
+        "chains_weights": (n_chains, n_draws, M),
+        "chains_gamma": (n_chains, n_draws, B),
+        "chains_theta": (n_chains, n_draws, P),
+        "chains_Z": (n_chains, n_draws, K),
+        "chains_loglik": (n_chains, n_draws),
+        "templates": (data["energy"].size, M),
+        "backgrounds": (data["energy"].size, B),
+    }
+    for name, expected_shape in expected_shapes.items():
+        actual_shape = posterior[name].shape
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Saved {name} shape {actual_shape} does not match model "
+                f"configuration {expected_shape}."
+            )
+
+
+def plot_activity_prior(output_dir, alpha, beta_bq, pi, show=False):
     """Plot the manuscript spike-and-slab activity prior."""
-    pi = 0.5
-    alpha = 2.5
-    beta_bq = 1500.0
     activity_kbq = np.linspace(0.001, 12.0, 4000)
     activity_bq = 1000.0 * activity_kbq
     slab_density = (
@@ -686,7 +807,7 @@ def plot_template_overlays(data, posterior, reconstruction, result_dir,
     mask = (energy >= 20.0) & (energy <= 300.0)
     unshifted = posterior["templates"][:, template_index]
     shifted = reconstruction["template_interpolators"][template_index](
-        energy - theta_mean
+        energy + theta_mean
     )
     fig, ax = plt.subplots(figsize=(7.16, 3.8))
     ax.plot(
@@ -761,6 +882,7 @@ def main():
         raise FileNotFoundError(f"Saved result directory not found: {result_dir}")
 
     posterior = load_saved_posterior(result_dir)
+    validate_saved_analysis(data, posterior)
     context_dir = base / "Spectra_plots"
     context_dir.mkdir(parents=True, exist_ok=True)
 
@@ -771,7 +893,20 @@ def main():
     )
 
     if not arguments.skip_library_plots:
-        plot_activity_prior(context_dir, show=arguments.show)
+        activity_prior = posterior["metadata"]["model"]["priors"][
+            "activity_inverse_gamma"
+        ]
+        plot_activity_prior(
+            context_dir,
+            alpha=float(activity_prior["alpha"]),
+            beta_bq=float(activity_prior["beta_Bq"]),
+            pi=float(
+                posterior["metadata"]["model"]["priors"][
+                    "isotope_inclusion_probability"
+                ]
+            ),
+            show=arguments.show,
+        )
         plot_original_template_panel(data, context_dir, show=arguments.show)
         plot_background_overlay(data, context_dir, show=arguments.show)
 

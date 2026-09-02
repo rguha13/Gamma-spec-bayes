@@ -129,8 +129,10 @@ Use `--results-dir` if the saved chains are in a non-default location.
 The output directory contains the retained chains for activities, inclusion
 indicators, template weights, background coefficients, and energy shifts;
 template and background cluster assignments; convergence diagnostics printed
-to the terminal; posterior summaries; the PeakAnalysis_G8 reference comparison;
-and the reconstructed-spectrum and posterior figures.
+to the terminal; accepted and attempted proposal counts; run/model metadata and
+the saved energy grid used to validate later plotting; posterior summaries; the
+PeakAnalysis_G8 reference comparison; and the reconstructed-spectrum and
+posterior figures.
 
 ## Citation
 
