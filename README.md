@@ -136,4 +136,4 @@ posterior figures.
 
 ## Citation
 
-Wübbeler, G., Stein, M., Fleischhack, H., Röttger, Stefan, Honig, A., & Elster, C. (2025), “Bayesian full-spectrum analysis of high-resolution gamma-ray spectra with energy scale correction and MCMC uncertainty quantification: Dataset and software”. Zenodo, Jun. 10, 2025. doi: 10.5281/zenodo.15631392.
+Wübbeler, G., Stein, M., Fleischhack, H., Röttger, S., & Honig, A. (2025). Bayesian full-spectrum analysis of high-resolution gamma-ray spectra with energy scale correction and MCMC uncertainty quantification: Dataset and software [Dataset]. Zenodo. [https://doi.org/10.5281/zenodo.15631392](https://doi.org/10.5281/zenodo.15631392)
