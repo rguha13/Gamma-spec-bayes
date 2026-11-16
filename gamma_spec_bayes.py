@@ -1,1687 +1,676 @@
-# =============================================================================
-# Bayesian Full-Spectrum Analysis for Radioisotope Identification
-# =============================================================================
-# IEEE Transactions on Nuclear Science — Riana Guha et al.
-#
-# Final clustered-template model:
-#   All 11 isotopes and all 31 original templates enter the candidate library.
-#   Near-duplicate templates are clustered by cosine similarity and Pearson
-#   correlation. The first member represents each cluster, and cluster
-#   contributions enter through simplex weights.
-#   Activities, inclusion indicators, and shifts are sampled at isotope level.
-#   Isotope/background energy shifts use theta ~ N(0, 0.5^2) keV.
-#   R-hat and ESS diagnostics are calculated with ArviZ.
-#   Activities are compared with PeakAnalysis_G8 references from file 021.
-# =============================================================================
+"""Bayesian gamma-spectrum analysis with background-corrected templates.
+
+Place this file beside the input tables. Run numbers are ONE-based.
+
+    python gamma_spec_bayes.py --mixture 849-23-P058-111 --run 1
+    python gamma_spec_bayes.py --mixture all --run 1
+    python gamma_spec_bayes.py --mixture all --run all
+
+Requires numpy, scipy, pandas, openpyxl, arviz, and matplotlib.
+"""
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass
+from datetime import datetime
 import json
+import multiprocessing
 import os
-import time
-import pandas as pd
-import numpy as np
-from scipy.interpolate import PchipInterpolator
-from scipy.special import gammaln
 from pathlib import Path
-import arviz as az
-
-# =============================================================================
-# PATHS & DATA LOADING
-# =============================================================================
-
-
-def parse_args():
-    project_dir = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(
-        description="Bayesian full-spectrum analysis of one HPGe mixture spectrum."
-    )
-    parser.add_argument(
-        "--data-dir", type=Path, default=project_dir,
-        help="Directory containing the Wübbeler et al. data files.",
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=None,
-        help="Output root (default: <data-dir>/results).",
-    )
-    parser.add_argument("--mixture-index", type=int, default=1)
-    parser.add_argument("--run-index", type=int, default=0)
-    parser.add_argument("--n-chains", type=int, default=4)
-    parser.add_argument("--n-iter", type=int, default=20000)
-    parser.add_argument("--burnin", type=int, default=5000)
-    return parser.parse_args()
-
-
-args = parse_args()
-base = args.data_dir.expanduser().resolve()
-
-save_root = (
-    args.output_dir.expanduser().resolve()
-    if args.output_dir is not None else base / "results"
-)
-os.makedirs(save_root, exist_ok=True)
-
-required_data_files = [
-    "02_A_REF.xlsx", "03_Templates_A_REF.xlsx", "042_DATA_ECal.xlsx",
-    "04_DATA_spectra.xlsx", "021_A_REF_main.csv", "05_Half_lives.csv",
-]
-missing_data_files = [name for name in required_data_files if not (base / name).is_file()]
-if missing_data_files:
-    raise FileNotFoundError(
-        f"Missing required data files in {base}: {missing_data_files}"
-    )
-
-tmls      = pd.read_excel(base / "02_A_REF.xlsx")
-tref      = pd.read_excel(base / "03_Templates_A_REF.xlsx")
-ecal      = pd.read_excel(base / "042_DATA_ECal.xlsx")
-spectra   = pd.read_excel(base / "04_DATA_spectra.xlsx")
-
-all_spectra = spectra.iloc[:, 4:].to_numpy()
-spectra_files = spectra['Filename'].astype(str).to_numpy()
-ecal_files = ecal['Filename'].astype(str).to_numpy()
-ecal_columns = ["Ecal_b0_GX", "Ecal_b1_GX"]
-if pd.Series(ecal_files).duplicated().any():
-    raise ValueError("042_DATA_ECal.xlsx contains duplicate filenames.")
-iso_names   = np.array(
-    ['Na22','Mn54','Co57','Co60','Zn65','Y88','Cd109','Cs134','Cs137','Pb210','Am241'],
-    dtype=str
-)
-nuclide_list = tref['Nuclide'].astype(str).to_numpy()
-
-# =============================================================================
-# BUILD SINGLE-ISOTOPE SPECTRA STRUCTURES
-# =============================================================================
-single_spectra = [[] for _ in iso_names]
-
-for iso_index, iso in enumerate(iso_names):
-    match   = np.where(nuclide_list == iso)[0]
-    msids   = np.unique(tref['MeasurementSeriesID_613'].iloc[match].astype(str))
-
-    for ms in msids:
-        entry = {}
-        entry['MSID'] = ms
-
-        ind_msid        = tref['MeasurementSeriesID_613'] == ms
-        entry['A']      = tref.loc[ind_msid, 'A_Bq'].to_numpy()
-        entry['Filename'] = tref.loc[ind_msid, 'Filename'].astype(str).to_numpy()
-
-        counts_list, lt_list, ecal_list = [], [], []
-        for fname in entry['Filename']:
-            idx = np.where(spectra_files == fname)[0][0]
-            idx_ec = np.where(ecal_files == fname)[0][0]
-            counts_list.append(all_spectra[idx, :])
-            lt_list.append(spectra['t_live_s'].iloc[idx])
-            ecal_list.append(
-                ecal.loc[idx_ec, ecal_columns].to_numpy(dtype=float)
-            )
-
-        entry['Counts']   = np.vstack(counts_list)
-        entry['Livetime'] = np.array(lt_list)
-        entry['Ecal']     = np.vstack(ecal_list)
-        single_spectra[iso_index].append(entry)
-
-# Background spectra
-msid_list      = spectra['MeasurementSeriesID_613'].astype(str).to_numpy()
-is_background  = np.array(['-NE-' in m for m in msid_list])
-background_msids = np.unique(msid_list[is_background])
-
-ne_spectra = []
-for ms in background_msids:
-    entry = {}
-    entry['MSID'] = ms
-    inds          = np.where(msid_list == ms)[0]
-    entry['Filename'] = spectra['Filename'].iloc[inds].astype(str).to_numpy()
-
-    counts_list, lt_list, ecal_list = [], [], []
-    for idx in inds:
-        fname = str(spectra['Filename'].iloc[idx])
-        idx_ec = np.where(ecal_files == fname)[0][0]
-        counts_list.append(all_spectra[idx, :])
-        lt_list.append(spectra['t_live_s'].iloc[idx])
-        ecal_list.append(
-            ecal.loc[idx_ec, ecal_columns].to_numpy(dtype=float)
-        )
-
-    entry['Counts']   = np.vstack(counts_list)
-    entry['Livetime'] = np.array(lt_list)
-    entry['Ecal']     = np.vstack(ecal_list)
-    ne_spectra.append(entry)
-
-# Mixture spectra
-mls_spectra = []
-mls_ids     = tmls['MeasurementSeriesID_613'].astype(str).unique()
-
-for ms in mls_ids:
-    entry = {}
-    entry['MSID'] = ms
-    inds          = np.where(tmls['MeasurementSeriesID_613'].astype(str).to_numpy() == ms)[0]
-    filenames     = np.unique(tmls['Filename'].iloc[inds].astype(str))
-    entry['Filename'] = filenames
-
-    counts, lt, ecal_vals = [], [], []
-    for fname in filenames:
-        idx = np.where(spectra_files == fname)[0][0]
-        counts.append(all_spectra[idx, :])
-        lt.append(spectra['t_live_s'].iloc[idx])
-        idx_ec = np.where(ecal_files == fname)[0][0]
-        ecal_vals.append(
-            ecal.loc[idx_ec, ecal_columns].to_numpy(dtype=float)
-        )
-
-    entry['Counts']   = np.vstack(counts)
-    entry['Livetime'] = np.array(lt)
-    entry['Ecal']     = np.vstack(ecal_vals)
-    mls_spectra.append(entry)
-
-print("Loaded:")
-print(f"  {len(single_spectra)} isotopes")
-print(f"  {len(ne_spectra)} background runs")
-print(f"  {len(mls_spectra)} mixture spectra")
-
-# =============================================================================
-# SELECT MIXTURE AND DEFINE ITS RUN-SPECIFIC ENERGY GRID
-# =============================================================================
-i_mix = args.mixture_index
-r_run = args.run_index
-
-mix0 = mls_spectra[i_mix]
-Y0   = mix0["Counts"][r_run, :].astype(float)
-T0   = float(mix0["Livetime"][r_run])
-
-C = Y0.size
-channels = np.arange(1, C + 1, dtype=float)
-ecal_run0 = mix0["Ecal"][r_run, :]
-a_cal, b_cal = float(ecal_run0[0]), float(ecal_run0[1])
-energy_template = a_cal + b_cal * channels
-energy = energy_template.copy()
-
-save_dir = save_root / f"{mix0['MSID']}_run{r_run}_all_isotopes_clustered_first_representative"
-os.makedirs(save_dir, exist_ok=True)
-
-# =============================================================================
-# BUILD TEMPLATES
-# =============================================================================
-def register_to_energy_grid(values, calibration, channels, common_energy):
-    """Register one native-channel spectrum on the selected run's grid."""
-    b0, b1 = float(calibration[0]), float(calibration[1])
-    if not np.isfinite(b0) or not np.isfinite(b1) or b1 <= 0:
-        raise ValueError(f"Invalid energy calibration: b0={b0}, b1={b1}")
-    native_energy = b0 + b1 * channels
-    registered = PchipInterpolator(
-        native_energy, values, extrapolate=True
-    )(common_energy)
-    target_bin_width = float(np.median(np.diff(common_energy)))
-    registered *= target_bin_width / b1
-    return np.clip(registered, 0.0, None)
-
-
-def build_template_spectra_py(single_spectra, ne_spectra, channels,
-                              common_energy):
-    K = len(single_spectra)
-    B = len(ne_spectra)
-    if B == 0:
-        raise ValueError("No background spectra found.")
-
-    C     = ne_spectra[0]["Counts"].shape[1]
-    N_rep = [len(single_spectra[k]) for k in range(K)]
-    M     = sum(N_rep)
-
-    X_iso = np.zeros((C, M), dtype=float)
-    X_bg  = np.zeros((C, B), dtype=float)
-
-    iso_of_col         = np.zeros(M, dtype=int)
-    iso_template_id    = []
-    iso_index          = [[] for _ in range(K)]
-    template_livetime  = np.zeros(M, dtype=float)
-    background_livetime = np.zeros(B, dtype=float)
-
-    col = 0
-    for j in range(K):
-        for n in range(N_rep[j]):
-            entry = single_spectra[j][n]
-            Cnts  = entry["Counts"]
-            LT    = entry["Livetime"]
-            A     = entry["A"]
-            Ecal  = entry["Ecal"]
-
-            valid = (
-                np.isfinite(LT) & (LT > 0) & np.isfinite(A) & (A > 0)
-                & np.all(np.isfinite(Ecal), axis=1) & (Ecal[:, 1] > 0)
-            )
-            if valid.sum() == 0:
-                raise ValueError(f"No valid runs for isotope j={j}, replicate n={n}.")
-
-            Cnts_v       = Cnts[valid, :]
-            LT_v         = LT[valid]
-            A_v          = A[valid]
-            Ecal_v       = Ecal[valid, :]
-            rate_per_bq  = (Cnts_v / LT_v[:, None]) / A_v[:, None]
-            registered_runs = np.vstack([
-                register_to_energy_grid(
-                    rate_per_bq[r], Ecal_v[r], channels, common_energy
-                )
-                for r in range(len(LT_v))
-            ])
-            w            = LT_v / LT_v.sum()
-            X_iso[:, col] = (w[:, None] * registered_runs).sum(axis=0)
-            template_livetime[col] = LT_v.sum()
-
-            iso_of_col[col]  = j
-            iso_index[j].append(col)
-            iso_template_id.append(entry.get("MSID", f"iso{j}_rep{n}"))
-            col += 1
-
-    assert col == M
-
-    for b, bg_entry in enumerate(ne_spectra):
-        C_bg    = bg_entry["Counts"]
-        LT_bg   = bg_entry["Livetime"]
-        Ecal_bg = bg_entry["Ecal"]
-        valid_bg = (
-            np.isfinite(LT_bg) & (LT_bg > 0)
-            & np.all(np.isfinite(Ecal_bg), axis=1) & (Ecal_bg[:, 1] > 0)
-        )
-        if valid_bg.sum() == 0:
-            raise ValueError(f"No valid background runs for b={b}.")
-        C_bg_v = C_bg[valid_bg, :]
-        LT_bg_v = LT_bg[valid_bg]
-        Ecal_bg_v = Ecal_bg[valid_bg, :]
-        registered_bg_runs = np.vstack([
-            register_to_energy_grid(
-                C_bg_v[r] / LT_bg_v[r], Ecal_bg_v[r], channels,
-                common_energy
-            )
-            for r in range(len(LT_bg_v))
-        ])
-        w_bg = LT_bg_v / LT_bg_v.sum()
-        X_bg[:, b] = (w_bg[:, None] * registered_bg_runs).sum(axis=0)
-        background_livetime[b] = LT_bg_v.sum()
-
-    info = {
-        "iso_of_col": iso_of_col, "iso_index": iso_index,
-        "iso_template_id": iso_template_id,
-        "template_livetime": template_livetime,
-        "background_livetime": background_livetime,
-    }
-    return X_iso, X_bg, info
-
-
-X_library, X_bg, info = build_template_spectra_py(
-    single_spectra, ne_spectra, channels, energy_template
-)
-print(f"Registered full template library shape (C, M): {X_library.shape}")
-print(f"X_bg  shape (C, B): {X_bg.shape}")
-
-C, M_library = X_library.shape
-library_iso_of_template = info["iso_of_col"]
-library_template_labels = np.array([
-    f"{iso_names[library_iso_of_template[m]]}_{info['iso_template_id'][m]}"
-    for m in range(M_library)
-], dtype=str)
-
-# Use all 11 isotope families and all 31 original templates as clustering
-# candidates. Only the first member of each within-isotope cluster enters X.
-model_isotope_names = iso_names.copy()
-model_iso_global_idx = np.arange(len(iso_names), dtype=int)
-model_template_global_idx = np.concatenate([
-    np.asarray(info["iso_index"][global_j], dtype=int)
-    for global_j in model_iso_global_idx
-])
-
-X_candidate = X_library[:, model_template_global_idx]
-candidate_template_labels = library_template_labels[model_template_global_idx]
-candidate_template_livetime = info["template_livetime"][
-    model_template_global_idx
-]
-iso_of_candidate_global = library_iso_of_template[model_template_global_idx]
-iso_of_candidate_model = np.array([
-    int(np.where(model_iso_global_idx == global_j)[0][0])
-    for global_j in iso_of_candidate_global
-], dtype=int)
-
-K = len(model_isotope_names)
-
-# =============================================================================
-# COSINE-SIMILARITY MAP AND WITHIN-ISOTOPE CLUSTERING
-# =============================================================================
-similarity_energy_min = 20.0
-similarity_energy_max = 1500.0
-cosine_cluster_threshold = 0.999
-pearson_cluster_threshold = 0.999
-similarity_mask = (
-    (energy_template >= similarity_energy_min)
-    & (energy_template <= similarity_energy_max)
-)
-
-candidate_vectors = X_candidate[similarity_mask, :].T
-candidate_norms = np.linalg.norm(candidate_vectors, axis=1)
-if np.any(~np.isfinite(candidate_norms)) or np.any(candidate_norms <= 0):
-    raise ValueError("Every candidate template must have a finite nonzero norm.")
-candidate_unit_vectors = candidate_vectors / candidate_norms[:, None]
-cosine_similarity = np.clip(
-    candidate_unit_vectors @ candidate_unit_vectors.T, -1.0, 1.0
-)
-pearson_correlation = np.corrcoef(candidate_vectors)
-
-similarity_df = pd.DataFrame(
-    cosine_similarity,
-    index=candidate_template_labels,
-    columns=candidate_template_labels,
-)
-similarity_df.to_csv(save_dir / "template_cosine_similarity.csv")
-pd.DataFrame(
-    pearson_correlation,
-    index=candidate_template_labels,
-    columns=candidate_template_labels,
-).to_csv(save_dir / "template_pearson_correlation.csv")
-
-# Deterministic representative-based clustering. Candidate templates are
-# processed in their existing order. A template joins the first cluster for
-# its isotope whose representative has similarity at or above the threshold;
-# otherwise it starts a new cluster. The representative is therefore always
-# the first member of a cluster, as requested.
-template_clusters = []
-candidate_cluster_id = np.full(len(candidate_template_labels), -1, dtype=int)
-for j in range(K):
-    isotope_candidates = np.where(iso_of_candidate_model == j)[0]
-    isotope_cluster_ids = []
-    for candidate_m in isotope_candidates:
-        assigned_cluster = None
-        for cluster_id in isotope_cluster_ids:
-            representative_m = template_clusters[cluster_id][0]
-            if (
-                cosine_similarity[candidate_m, representative_m]
-                >= cosine_cluster_threshold
-                and pearson_correlation[candidate_m, representative_m]
-                >= pearson_cluster_threshold
-            ):
-                assigned_cluster = cluster_id
-                break
-        if assigned_cluster is None:
-            assigned_cluster = len(template_clusters)
-            template_clusters.append([int(candidate_m)])
-            isotope_cluster_ids.append(assigned_cluster)
-        else:
-            template_clusters[assigned_cluster].append(int(candidate_m))
-        candidate_cluster_id[candidate_m] = assigned_cluster
-
-cluster_rows = []
-for cluster_id, members in enumerate(template_clusters):
-    representative_m = members[0]
-    member_livetimes = candidate_template_livetime[members]
-    normalized_livetime_weights = member_livetimes / member_livetimes.sum()
-    for local_id, candidate_m in enumerate(members):
-        cluster_rows.append({
-            "Cluster": cluster_id,
-            "Isotope": model_isotope_names[
-                iso_of_candidate_model[candidate_m]
-            ],
-            "Candidate_index": candidate_m,
-            "Library_column": int(model_template_global_idx[candidate_m]),
-            "Template": candidate_template_labels[candidate_m],
-            "Livetime_s": candidate_template_livetime[candidate_m],
-            "Cluster_livetime_weight": normalized_livetime_weights[local_id],
-            "Representative": candidate_m == representative_m,
-            "Representative_template": candidate_template_labels[
-                representative_m
-            ],
-            "Cosine_to_representative": cosine_similarity[
-                candidate_m, representative_m
-            ],
-            "Pearson_to_representative": pearson_correlation[
-                candidate_m, representative_m
-            ],
-            "Cosine_threshold": cosine_cluster_threshold,
-            "Pearson_threshold": pearson_cluster_threshold,
-            "Energy_min_keV": similarity_energy_min,
-            "Energy_max_keV": similarity_energy_max,
-        })
-cluster_table = pd.DataFrame(cluster_rows)
-cluster_table.to_csv(save_dir / "template_clusters.csv", index=False)
-
-cluster_members = [np.asarray(members, dtype=int) for members in template_clusters]
-representative_candidate_idx = np.array(
-    [members[0] for members in cluster_members], dtype=int
-)
-X_template = X_candidate[:, representative_candidate_idx]
-iso_of_template_model = np.array([
-    iso_of_candidate_model[members[0]] for members in cluster_members
-], dtype=int)
-template_labels = candidate_template_labels[representative_candidate_idx]
-M = X_template.shape[1]
-model_iso_index = [
-    np.where(iso_of_template_model == j)[0].astype(int)
-    for j in range(K)
-]
-
-# Cluster the measured backgrounds by the same pairwise shape checks and keep
-# the first measurement in each cluster. No background averaging is applied.
-B_library = X_bg.shape[1]
-background_cosine_threshold = 0.995
-background_pearson_threshold = 0.995
-background_vectors = X_bg[similarity_mask, :].T
-background_norms = np.linalg.norm(background_vectors, axis=1)
-background_cosine_similarity = np.clip(
-    (background_vectors / background_norms[:, None])
-    @ (background_vectors / background_norms[:, None]).T,
-    -1.0, 1.0
-)
-background_pearson_correlation = (
-    np.ones((1, 1), dtype=float) if B_library == 1
-    else np.corrcoef(background_vectors)
-)
-pd.DataFrame(
-    background_cosine_similarity,
-    index=[f"Background_{b}" for b in range(B_library)],
-    columns=[f"Background_{b}" for b in range(B_library)],
-).to_csv(save_dir / "background_cosine_similarity.csv")
-pd.DataFrame(
-    background_pearson_correlation,
-    index=[f"Background_{b}" for b in range(B_library)],
-    columns=[f"Background_{b}" for b in range(B_library)],
-).to_csv(save_dir / "background_pearson_correlation.csv")
-
-background_clusters = []
-background_cluster_id = np.full(B_library, -1, dtype=int)
-for background_id in range(B_library):
-    assigned_cluster = None
-    for cluster_id, members in enumerate(background_clusters):
-        representative_id = members[0]
-        if (
-            background_cosine_similarity[background_id, representative_id]
-            >= background_cosine_threshold
-            and background_pearson_correlation[background_id, representative_id]
-            >= background_pearson_threshold
-        ):
-            assigned_cluster = cluster_id
-            break
-    if assigned_cluster is None:
-        assigned_cluster = len(background_clusters)
-        background_clusters.append([background_id])
-    else:
-        background_clusters[assigned_cluster].append(background_id)
-    background_cluster_id[background_id] = assigned_cluster
-
-background_representative_idx = np.array(
-    [members[0] for members in background_clusters], dtype=int
-)
-X_background = X_bg[:, background_representative_idx]
-background_labels = np.array([
-    f"Background_{background_id}"
-    for background_id in background_representative_idx
-], dtype=str)
-
-background_cluster_rows = []
-for cluster_id, members in enumerate(background_clusters):
-    representative_id = members[0]
-    for background_id in members:
-        background_cluster_rows.append({
-            "Cluster": cluster_id,
-            "Background_index": background_id,
-            "Background": f"Background_{background_id}",
-            "Representative": background_id == representative_id,
-            "Representative_background": f"Background_{representative_id}",
-            "Cosine_to_representative": background_cosine_similarity[
-                background_id, representative_id
-            ],
-            "Pearson_to_representative": background_pearson_correlation[
-                background_id, representative_id
-            ],
-            "Cosine_threshold": background_cosine_threshold,
-            "Pearson_threshold": background_pearson_threshold,
-        })
-pd.DataFrame(background_cluster_rows).to_csv(
-    save_dir / "background_clusters.csv", index=False
-)
-
-B = X_background.shape[1]
-P          = K + B
-background_shift_labels = background_labels.copy()
-alignment_labels = np.concatenate([
-    model_isotope_names, background_shift_labels
-])
-
-# =============================================================================
-# INTERPOLATORS AND HYPERPARAMETERS
-# =============================================================================
-F_template_energy = [
-    PchipInterpolator(energy_template, X_template[:, m], extrapolate=True)
-    for m in range(M)
-]
-F_bg_energy = [
-    PchipInterpolator(energy_template, X_background[:, b], extrapolate=True)
-    for b in range(B)
-]
-
-# Prior hyperparameters
-alpha_ig    = 2.5
-beta_ig     = 1500      # Bq; IG prior on activity (mean = 1000 Bq)
-pi_iso_prior = 0.5
-pi = pi_iso_prior * np.ones(K)
-sigma_theta = 0.5  # keV; isotope-level and background shifts
-s_gamma     = 0.5 * np.ones(B)
-weight_dirichlet_alpha = 1.0
-weight_proposal_concentration = 2000.0 * np.ones(K)
-
-# Isotope-specific Dirichlet proposal concentrations. A smaller concentration
-# produces larger simplex moves; a larger concentration produces smaller moves.
-weight_proposal_concentration[model_isotope_names == "Co57"] = 750.0
-weight_proposal_concentration[model_isotope_names == "Cd109"] = 5000.0
-
-# Proposal scales
-step_logA = 0.01 * np.ones(K)
-step_logA[model_isotope_names == "Cd109"] = 0.003
-
-step_gamma = 0.002 * np.ones(B)
-
-step_theta = 0.006 * np.ones(K + B)
-step_theta[np.where(model_isotope_names == "Cd109")[0][0]] = 0.0015
-step_theta[np.where(model_isotope_names == "Pb210")[0][0]] = 0.005
-step_theta[K:] = 0.001
-
-print(f"\nSelected mixture : {mix0['MSID']}")
-print(f"Mixture index     : {i_mix} (0-indexed)")
-print(f"Selected run      : {r_run} ({mix0['Filename'][r_run]})")
-print(f"042 calibration   : b0 = {a_cal:.9g} keV, b1 = {b_cal:.9g} keV/channel")
-print(f"Candidate isotopes : {', '.join(model_isotope_names)}")
-print(
-    f"Template clustering: cosine>={cosine_cluster_threshold:.6f}, "
-    f"Pearson>={pearson_cluster_threshold:.6f}, "
-    f"energy={similarity_energy_min:g}-{similarity_energy_max:g} keV"
-)
-print(
-    f"Template reduction : {X_candidate.shape[1]} candidates -> "
-    f"{M} shape clusters"
-)
-for j, isotope in enumerate(model_isotope_names):
-    candidate_count = int((iso_of_candidate_model == j).sum())
-    print(
-        f"  {isotope:6s}: {candidate_count} candidates -> "
-        f"{len(model_iso_index[j])} clusters"
-    )
-for cluster_id, members in enumerate(template_clusters):
-    labels = ", ".join(candidate_template_labels[m] for m in members)
-    print(
-        f"  cluster {cluster_id:02d}: representative="
-        f"{candidate_template_labels[members[0]]}; members={labels}"
-    )
-print(f"B = {B} background components")
-print(
-    f"Background clustering: cosine>={background_cosine_threshold:.6f}, "
-    f"Pearson>={background_pearson_threshold:.6f}; "
-    f"{B_library} measurements -> {B} clusters"
-)
-for cluster_id, members in enumerate(background_clusters):
-    labels = ", ".join(f"Background_{b}" for b in members)
-    print(
-        f"  background cluster {cluster_id:02d}: representative="
-        f"Background_{members[0]}; members={labels}"
-    )
-print(f"Alignment shifts  : {P} total ({K} isotopes + {B} background)")
-
-# =============================================================================
-# LIKELIHOOD UTILITIES
-# =============================================================================
-def compute_mu(A0, weights, Gamma0, theta, Z, T0, F_iso_energy,
-               F_bg_energy, iso_index, energy_template):
-    """Expected counts using first-in-cluster representative templates."""
-    signal = np.zeros_like(energy_template, dtype=float)
-    for j in range(len(A0)):
-        if Z[j] == 1 and A0[j] > 0:
-            isotope_response = np.zeros_like(energy_template, dtype=float)
-            for cluster_id in iso_index[j]:
-                isotope_response += weights[cluster_id] * F_iso_energy[cluster_id](
-                    energy_template + theta[j]
-                )
-            signal += A0[j] * isotope_response
-    bg = np.zeros_like(energy_template, dtype=float)
-    for b in range(len(Gamma0)):
-        if Gamma0[b] > 0:
-            bg += Gamma0[b] * F_bg_energy[b](
-                energy_template + theta[len(A0) + b]
-            )
-    return np.clip(T0 * (signal + bg), 1e-12, None)
-
-
-def loglik(Y0, A0, weights, Gamma0, theta, Z, T0, F_iso_energy,
-           F_bg_energy, iso_index, energy_template):
-    mu = compute_mu(
-        A0, weights, Gamma0, theta, Z, T0, F_iso_energy, F_bg_energy,
-        iso_index, energy_template
-    )
-    return np.sum(Y0 * np.log(mu) - mu)
-
-# =============================================================================
-# METROPOLIS–HASTINGS UPDATE FUNCTIONS
-# (Each returns True on acceptance, False on rejection — for acceptance tracking)
-# =============================================================================
-def mh_update_A_j(j, Y0, A0, weights, Gamma0, theta, Z, T0,
-                  alpha_ig, beta_ig, F_iso_energy, F_bg_energy, step_logA,
-                  iso_index, energy_template, rng):
-    if Z[j] == 0 or A0[j] <= 0:
-        return False
-    A_curr  = A0[j]
-    ll_curr = loglik(Y0, A0, weights, Gamma0, theta, Z, T0,
-                     F_iso_energy, F_bg_energy, iso_index, energy_template)
-    lp_curr = -(alpha_ig + 1.0) * np.log(A_curr) - beta_ig / A_curr
-
-    A_prop  = A_curr * np.exp(step_logA[j] * rng.normal())
-    A0[j]   = A_prop
-    ll_prop = loglik(Y0, A0, weights, Gamma0, theta, Z, T0,
-                     F_iso_energy, F_bg_energy, iso_index, energy_template)
-    lp_prop = -(alpha_ig + 1.0) * np.log(A_prop) - beta_ig / A_prop
-    log_acc = (ll_prop + lp_prop) - (ll_curr + lp_curr) + np.log(A_prop / A_curr)
-
-    if np.log(rng.uniform()) < log_acc:
-        return True
-    A0[j] = A_curr
-    return False
-
-
-def mh_update_Gamma_b(b, Y0, A0, weights, Gamma0, theta, Z, T0,
-                      s_gamma, F_iso_energy, F_bg_energy, step_gamma,
-                      iso_index, energy_template, rng):
-    G_curr  = Gamma0[b]
-    if G_curr <= 0:
-        return False
-    ll_curr = loglik(Y0, A0, weights, Gamma0, theta, Z, T0,
-                     F_iso_energy, F_bg_energy, iso_index, energy_template)
-    lp_curr = -0.5 * (G_curr ** 2) / (s_gamma[b] ** 2)
-
-    G_prop  = G_curr + rng.normal(0.0, step_gamma[b])
-    if G_prop <= 0:
-        return False
-    Gamma0[b] = G_prop
-    ll_prop = loglik(Y0, A0, weights, Gamma0, theta, Z, T0,
-                     F_iso_energy, F_bg_energy, iso_index, energy_template)
-    lp_prop = -0.5 * (G_prop ** 2) / (s_gamma[b] ** 2)
-    log_acc = (ll_prop + lp_prop) - (ll_curr + lp_curr)
-
-    if np.log(rng.uniform()) < log_acc:
-        return True
-    Gamma0[b] = G_curr
-    return False
-
-
-def mh_update_theta_p(p, Y0, A0, weights, Gamma0, theta, Z, T0,
-                      sigma_theta, F_iso_energy, F_bg_energy, step_theta,
-                      iso_index, energy_template, rng):
-    # When isotope p is absent, theta_p is independent of the likelihood and
-    # its full conditional is exactly its Normal prior. Drawing it directly
-    # prevents meaningless off-state random-walk modes.
-    if p < len(A0) and Z[p] == 0:
-        theta[p] = rng.normal(0.0, sigma_theta)
-        return True
-
-    theta_curr = theta[p]
-    ll_curr = loglik(Y0, A0, weights, Gamma0, theta, Z, T0,
-                     F_iso_energy, F_bg_energy, iso_index, energy_template)
-    lp_curr = -0.5 * (theta_curr / sigma_theta) ** 2
-
-    theta_prop = theta_curr + rng.normal(0.0, step_theta[p])
-    theta[p] = theta_prop
-    ll_prop = loglik(Y0, A0, weights, Gamma0, theta, Z, T0,
-                     F_iso_energy, F_bg_energy, iso_index, energy_template)
-    lp_prop = -0.5 * (theta_prop / sigma_theta) ** 2
-    log_acc = (ll_prop + lp_prop) - (ll_curr + lp_curr)
-
-    if np.log(rng.uniform()) < log_acc:
-        return True
-    theta[p] = theta_curr
-    return False
-
-
-def mh_flip_Z_j(j, Y0, A0, weights, Gamma0, theta, Z, T0,
-                alpha_ig, beta_ig, pi, F_iso_energy, F_bg_energy,
-                iso_index, energy_template, rng):
-    """Flip Z_j with an activity draw from the IG slab when switching on.
-
-    Because the on-proposal draws A_j from the same IG density used as the
-    slab prior, the activity prior/proposal terms cancel in the MH ratio.
-    The flip acceptance therefore compares the likelihood and Bernoulli
-    inclusion prior only.
-    """
-    Z_curr  = Z[j]
-    A_curr  = A0[j]
-    ll_curr = loglik(Y0, A0, weights, Gamma0, theta, Z, T0,
-                     F_iso_energy, F_bg_energy, iso_index, energy_template)
-
-    if Z_curr == 1:
-        if A_curr <= 0:
-            return False
-    lp_Z_curr = Z_curr * np.log(pi[j]) + (1 - Z_curr) * np.log(1 - pi[j])
-
-    if Z_curr == 0:
-        Z_prop = 1
-        A_prop = 1.0 / rng.gamma(shape=alpha_ig, scale=1.0 / beta_ig)
-        A0[j]  = A_prop
-    else:
-        Z_prop = 0
-        A_prop = 0.0
-        A0[j]  = 0.0
-    Z[j] = Z_prop
-
-    ll_prop = loglik(Y0, A0, weights, Gamma0, theta, Z, T0,
-                     F_iso_energy, F_bg_energy, iso_index, energy_template)
-    if Z_prop == 1:
-        if A_prop <= 0:
-            Z[j] = Z_curr; A0[j] = A_curr
-            return False
-    lp_Z_prop = Z_prop * np.log(pi[j]) + (1 - Z_prop) * np.log(1 - pi[j])
-    log_acc   = (ll_prop + lp_Z_prop) - (ll_curr + lp_Z_curr)
-
-    if np.log(rng.uniform()) < log_acc:
-        return True
-    Z[j] = Z_curr; A0[j] = A_curr
-    return False
-
-
-def log_dirichlet_pdf(values, alpha):
-    """Log density of a Dirichlet distribution."""
-    values = np.asarray(values, dtype=float)
-    alpha = np.asarray(alpha, dtype=float)
-    if np.any(values <= 0) or np.any(alpha <= 0):
+import time
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import nnls
+from scipy.special import gammaln
+from scipy.stats import gamma, norm
+
+
+# Settings define one model and sampling procedure for every mixture/run.
+# Proposal widths are numerical tuning parameters, not prior widths.
+ISOTOPES = ("Na22", "Mn54", "Co57", "Co60", "Zn65", "Y88", "Cd109",
+            "Cs134", "Cs137", "Pb210", "Am241")
+
+
+@dataclass
+class Settings:
+    energy_min: float = 20.0
+    energy_max: float = 2800.0
+    correction_background: str = "849-NE-23-1418"
+    isotope_similarity: float = 0.999
+    background_similarity: float = 0.995
+    slab_shape: float = 2.5
+    slab_quantile: float = 0.005
+    detection_alpha: float = 0.05
+    detection_beta: float = 0.05
+    inclusion_probability: float = 0.5
+    shift_prior_sd: float = 0.5
+    background_prior_sd: float = 0.5
+    broad_shift_probability: float = 0.20
+    broad_shift_sd: float = 0.35
+    log_activity_step: float = 0.01
+    log_background_step: float = 0.004
+    isotope_shift_step: float = 0.006
+    background_shift_step: float = 0.001
+    weight_concentration: float = 2000.0
+    adapt_interval: int = 200
+    target_acceptance: float = 0.30
+    chains: int = 4
+    iterations: int = 20000
+    burnin: int = 10000
+    seed: int = 123
+
+
+# Load spectra by filename so counts, livetimes, and energy calibrations match.
+# Mixture reference activities are used only in the final comparison.
+@dataclass
+class Spectrum:
+    filename: str
+    series: str
+    counts: np.ndarray
+    livetime: float
+    calibration: np.ndarray
+    start: pd.Timestamp
+
+    @property
+    def energy(self):
+        b0, b1 = self.calibration
+        return b0 + b1 * np.arange(1, len(self.counts) + 1)
+
+
+class Dataset:
+    def __init__(self, directory, settings):
+        self.directory = Path(directory)
+        spectra = pd.read_excel(self.directory / "04_DATA_spectra.xlsx")
+        calibrations = pd.read_excel(self.directory / "042_DATA_ECal.xlsx")
+        templates = pd.read_excel(self.directory / "03_Templates_A_REF.xlsx")
+        mixtures = pd.read_excel(self.directory / "02_A_REF.xlsx")
+        if spectra.Filename.duplicated().any() or calibrations.Filename.duplicated().any():
+            raise ValueError("Spectrum and calibration filenames must be unique.")
+        calibrations = calibrations.set_index("Filename")
+        self.spectra = {}
+        for i, row in spectra.iloc[:, :4].iterrows():
+            calibration = calibrations.loc[row.Filename, ["Ecal_b0_GX", "Ecal_b1_GX"]].to_numpy(float)
+            counts = spectra.iloc[i, 4:].to_numpy(float)
+            if (not np.isfinite(counts).all() or np.any(counts < 0)
+                    or not np.isfinite(calibration).all() or calibration[1] <= 0
+                    or not np.isfinite(row.t_live_s) or row.t_live_s <= 0):
+                raise ValueError(f"Invalid counts, livetime, or calibration: {row.Filename}")
+            self.spectra[row.Filename] = Spectrum(
+                row.Filename, row.MeasurementSeriesID_613, counts,
+                float(row.t_live_s), calibration, pd.Timestamp(row.t_start))
+        self.mixtures = {
+            str(series): sorted(group.Filename.unique())
+            for series, group in mixtures.groupby("MeasurementSeriesID_613", sort=False)
+        }
+        self.backgrounds = {
+            series: [s for s in self.spectra.values() if s.series == series]
+            for series in sorted({s.series for s in self.spectra.values() if "-NE-" in s.series})
+        }
+        reference_background = self.backgrounds[settings.correction_background]
+        self.templates = []
+        for isotope in ISOTOPES:
+            rows = templates.loc[templates.Nuclide == isotope]
+            if rows.empty:
+                raise ValueError(f"No calibration templates for {isotope}.")
+            for series, group in rows.groupby("MeasurementSeriesID_613", sort=True):
+                runs = []
+                for _, row in group.iterrows():
+                    spectrum = self.spectra[row.Filename]
+                    if not np.isfinite(row.A_Bq) or row.A_Bq <= 0:
+                        raise ValueError(f"Invalid calibration activity: {row.Filename}")
+                    bg_rate = pooled_background(reference_background, spectrum.energy)
+                    # Conditional Poisson MLE for a nonnegative native-channel source rate.
+                    response = np.maximum(spectrum.counts / spectrum.livetime - bg_rate, 0) / row.A_Bq
+                    runs.append((spectrum, response))
+                self.templates.append((isotope, f"{isotope}_{series}", runs))
+
+
+# Subtract background on each calibration run's native grid, then register
+# its cps/Bq response and average runs by livetime. Backgrounds retain cps units.
+def register(values, calibration, target_energy):
+    b0, b1 = calibration
+    native_energy = b0 + b1 * np.arange(1, len(values) + 1)
+    registered = PchipInterpolator(native_energy, values, extrapolate=True)(target_energy)
+    registered *= np.median(np.diff(target_energy)) / b1
+    return np.maximum(registered, 0)
+
+
+def pooled_background(spectra, energy):
+    times = np.array([s.livetime for s in spectra])
+    rates = np.array([register(s.counts / s.livetime, s.calibration, energy) for s in spectra])
+    return ((times / times.sum())[:, None] * rates).sum(axis=0)
+
+
+def cluster_templates(values, families, labels, threshold):
+    """Keep the first representative satisfying both within-family similarities."""
+    vectors = values.T
+    lengths = np.linalg.norm(vectors, axis=1)
+    if np.any(lengths == 0):
+        raise ValueError("A template has no response in the analysis range.")
+    unit = vectors / lengths[:, None]
+    cosine = np.clip(unit @ unit.T, -1, 1)
+    pearson = np.corrcoef(vectors) if len(vectors) > 1 else np.ones((1, 1))
+    representatives, membership = [], []
+    for i, family in enumerate(families):
+        matches = [r for r in representatives if families[r] == family
+                   and cosine[i, r] >= threshold and pearson[i, r] >= threshold]
+        representative = matches[0] if matches else i
+        if not matches:
+            representatives.append(i)
+        membership.append(dict(template=labels[i], family=family,
+            representative=labels[representative], is_representative=(i == representative),
+            cosine=cosine[i, representative], pearson=pearson[i, representative]))
+    return np.array(representatives), pd.DataFrame(membership), cosine, pearson
+
+
+# The background-only count benchmark calibrates the slab, not a hard isotope
+# detection limit. The detection errors and the slab quantile are distinct.
+# Count-limit equations follow MARLAP (2004), Chapter 20, Eqs. 20.26–20.28.
+def detection_limits(backgrounds, sample_time, settings):
+    counts = sum(s.counts[(s.energy >= settings.energy_min) &
+                          (s.energy <= settings.energy_max)].sum() for s in backgrounds)
+    background_time = sum(s.livetime for s in backgrounds)
+    expected = counts * sample_time / background_time
+    variance = expected * (1 + sample_time / background_time)
+    za, zb = norm.ppf(1 - settings.detection_alpha), norm.ppf(1 - settings.detection_beta)
+    lc = za * np.sqrt(variance)
+    ld = lc + zb**2 / 2 + zb * np.sqrt(variance + lc + zb**2 / 4)
+    return dict(background_counts=float(counts), background_livetime_s=background_time,
+        expected_background_counts=expected, null_variance=variance,
+        LC_counts=lc, LD_counts=ld, LQ_counts=50 + np.sqrt(2500 + 100 * variance))
+
+
+# Retain the full grid for shifted interpolation; only selected channels enter
+# the likelihood. Caching reuses exact interpolated arrays without approximation.
+class ShiftedTemplate:
+    def __init__(self, grid, values, energy):
+        self.interpolator = PchipInterpolator(grid, values, extrapolate=True)
+        self.energy = energy
+        self.cache = []
+
+    def __call__(self, shift):
+        for previous, values in self.cache:
+            if previous == shift:
+                return values
+        values = self.interpolator(self.energy + shift)
+        self.cache.insert(0, (float(shift), values))
+        self.cache = self.cache[:2]
+        return values
+
+
+@dataclass
+class Model:
+    spectrum: Spectrum
+    grid: np.ndarray
+    mask: np.ndarray
+    templates: np.ndarray
+    backgrounds: np.ndarray
+    labels: np.ndarray
+    background_labels: np.ndarray
+    groups: list
+    beta: np.ndarray
+
+    def __post_init__(self):
+        self.energy = self.grid[self.mask]
+        self.y = self.spectrum.counts[self.mask]
+        self.isotope_functions = [ShiftedTemplate(self.grid, x, self.energy) for x in self.templates.T]
+        self.background_functions = [ShiftedTemplate(self.grid, b, self.energy) for b in self.backgrounds.T]
+
+    def expected_counts(self, state):
+        signal = np.zeros_like(self.energy)
+        for j, columns in enumerate(self.groups):
+            if state.Z[j]:
+                response = sum(state.weights[k] * self.isotope_functions[k](state.theta[j]) for k in columns)
+                signal += state.A[j] * response
+        background = sum(state.Gamma[b] * f(state.theta[len(ISOTOPES) + b])
+                         for b, f in enumerate(self.background_functions))
+        return np.maximum(self.spectrum.livetime * (signal + background), 1e-12)
+
+    def loglik(self, state):
+        mu = self.expected_counts(state)
+        return float(np.sum(self.y * np.log(mu) - mu))
+
+
+def prepare_model(dataset, filename, settings, output):
+    spectrum = dataset.spectra[filename]
+    grid = spectrum.energy
+    mask = (grid >= settings.energy_min) & (grid <= settings.energy_max)
+    families, labels, columns = [], [], []
+    for isotope, label, runs in dataset.templates:
+        times = np.array([s.livetime for s, _ in runs])
+        values = np.array([register(response, s.calibration, grid) for s, response in runs])
+        columns.append(((times / times.sum())[:, None] * values).sum(axis=0))
+        families.append(isotope)
+        labels.append(label)
+    candidates = np.column_stack(columns)
+    background_candidates = np.column_stack([pooled_background(runs, grid) for runs in dataset.backgrounds.values()])
+    background_labels = [f"Background_{i}" for i in range(len(dataset.backgrounds))]
+    selections = []
+    for prefix, values, family, names, threshold in [
+        ("template", candidates, families, labels, settings.isotope_similarity),
+        ("background", background_candidates, ["background"] * len(background_labels),
+         background_labels, settings.background_similarity),
+    ]:
+        selected, membership, cosine, pearson = cluster_templates(values[mask], family, names, threshold)
+        selections.append(selected)
+        membership.to_csv(output / f"{prefix}_clusters.csv", index=False)
+        pd.DataFrame(cosine, index=names, columns=names).to_csv(output / f"{prefix}_cosine_similarity.csv")
+        pd.DataFrame(pearson, index=names, columns=names).to_csv(output / f"{prefix}_pearson_correlation.csv")
+    selected, selected_bg = selections
+    templates, backgrounds = candidates[:, selected], background_candidates[:, selected_bg]
+    retained_families = np.array(families)[selected]
+    groups = [np.flatnonzero(retained_families == name) for name in ISOTOPES]
+    limits = detection_limits(dataset.backgrounds[settings.correction_background], spectrum.livetime, settings)
+    response = np.array([spectrum.livetime * templates[mask][:, group].sum(axis=0).mean() for group in groups])
+    aD = limits["LD_counts"] / response
+    beta = gamma.ppf(1 - settings.slab_quantile, a=settings.slab_shape) * aD
+    pd.DataFrame(dict(isotope=ISOTOPES, response_counts_per_Bq=response,
+        reference_activity_Bq=aD, slab_scale_Bq=beta, slab_mode_Bq=beta / (settings.slab_shape + 1),
+        slab_mean_Bq=beta / (settings.slab_shape - 1))).to_csv(output / "slab_priors.csv", index=False)
+    (output / "detection_limits.json").write_text(json.dumps(limits, indent=2) + "\n")
+    return Model(spectrum, grid, mask, templates, backgrounds, np.array(labels)[selected],
+                 np.array(background_labels)[selected_bg], groups, beta)
+
+
+# A nonnegative spectral fit supplies activity starting values without using
+# known mixture composition or previous MCMC files. All isotopes initially
+# remain available; inclusion indicators subsequently follow the posterior.
+@dataclass
+class State:
+    A: np.ndarray
+    weights: np.ndarray
+    Gamma: np.ndarray
+    theta: np.ndarray
+    Z: np.ndarray
+
+    def copy(self):
+        return State(self.A.copy(), self.weights.copy(), self.Gamma.copy(), self.theta.copy(), self.Z.copy())
+
+
+def initial_state(model, settings):
+    k, b = len(ISOTOPES), len(model.background_labels)
+    weights = np.zeros(len(model.labels))
+    for group in model.groups:
+        weights[group] = 1 / len(group)
+    shapes = np.column_stack([model.templates[model.mask][:, group].mean(axis=1) for group in model.groups]
+                             + [column for column in model.backgrounds[model.mask].T])
+    design = model.spectrum.livetime * shapes
+    totals = design.sum(axis=0)
+    noise = np.sqrt(np.maximum(model.y, 1))
+    fitted_counts, _ = nnls(design / totals / noise[:, None], model.y / noise)
+    coefficients = fitted_counts / totals
+    # A prior-mode starting value keeps zero NNLS coefficients inside the slab;
+    # it is not a floor on sampled activities or an isotope selection rule.
+    activities = np.maximum(coefficients[:k], model.beta / (settings.slab_shape + 1))
+    background = np.maximum(coefficients[k:], 1e-6)
+    return State(activities, weights, background, np.zeros(k + b), np.ones(k, dtype=int))
+
+
+# Metropolis–Hastings updates target the unchanged Poisson spike-and-slab
+# posterior. Log-normal and Dirichlet proposals include their Hastings ratios.
+def log_dirichlet(values, alpha):
+    if np.any(values <= 0):
         return -np.inf
-    return (
-        gammaln(alpha.sum()) - gammaln(alpha).sum()
-        + np.sum((alpha - 1.0) * np.log(values))
-    )
+    return gammaln(alpha.sum()) - gammaln(alpha).sum() + np.sum((alpha - 1) * np.log(values))
 
 
-def mh_update_weights_j(j, Y0, A0, weights, Gamma0, theta, Z, T0,
-                        weight_dirichlet_alpha,
-                        weight_proposal_concentration,
-                        F_iso_energy, F_bg_energy, iso_index,
-                        energy_template, rng):
-    """Update simplex weights for the retained templates of isotope j."""
-    cols_j = iso_index[j]
-    if len(cols_j) <= 1:
-        weights[cols_j] = 1.0
+class Sampler:
+    def __init__(self, model, state, settings, rng):
+        self.model, self.state, self.settings, self.rng = model, state, settings, rng
+        self.ll = model.loglik(state)
+
+    def accept(self, proposal, prior_ratio=0.0, hastings=0.0):
+        proposed_ll = self.model.loglik(proposal)
+        if np.log(self.rng.uniform()) < proposed_ll - self.ll + prior_ratio + hastings:
+            self.state, self.ll = proposal, proposed_ll
+            return True
         return False
 
-    prior_alpha = weight_dirichlet_alpha * np.ones(len(cols_j))
-    if Z[j] == 0:
-        # With the isotope absent, weights have their prior full conditional.
-        weights[cols_j] = rng.dirichlet(prior_alpha)
-        return True
+    def flip(self, j):
+        proposal = self.state.copy()
+        proposal.Z[j] = 1 - proposal.Z[j]
+        proposal.A[j] = (1 / self.rng.gamma(self.settings.slab_shape, 1 / self.model.beta[j])
+                         if proposal.Z[j] else 0.0)
+        pi = self.settings.inclusion_probability
+        ratio = (proposal.Z[j] - self.state.Z[j]) * np.log(pi / (1 - pi))
+        # Drawing the birth activity from its slab cancels prior/proposal terms.
+        return self.accept(proposal, ratio)
 
-    current = weights[cols_j].copy()
-    ll_curr = loglik(
-        Y0, A0, weights, Gamma0, theta, Z, T0,
-        F_iso_energy, F_bg_energy, iso_index, energy_template
-    )
-    lp_curr = log_dirichlet_pdf(current, prior_alpha)
+    def activity(self, j, step):
+        proposal = self.state.copy()
+        old = proposal.A[j]
+        new = old * np.exp(step * self.rng.normal())
+        proposal.A[j] = new
+        ratio = -(self.settings.slab_shape + 1) * np.log(new / old) - self.model.beta[j] * (1 / new - 1 / old)
+        return self.accept(proposal, ratio, np.log(new / old))
 
-    proposal_concentration = weight_proposal_concentration[j]
-    forward_alpha = proposal_concentration * current + 1.0
-    proposal = rng.dirichlet(forward_alpha)
-    weights[cols_j] = proposal
-    ll_prop = loglik(
-        Y0, A0, weights, Gamma0, theta, Z, T0,
-        F_iso_energy, F_bg_energy, iso_index, energy_template
-    )
-    lp_prop = log_dirichlet_pdf(proposal, prior_alpha)
+    def weights(self, j, concentration):
+        columns = self.model.groups[j]
+        if not self.state.Z[j]:
+            self.state.weights[columns] = self.rng.dirichlet(np.ones(len(columns)))
+            return False
+        proposal = self.state.copy()
+        old = self.state.weights[columns]
+        new = self.rng.dirichlet(concentration * old + 1)
+        proposal.weights[columns] = new
+        hastings = log_dirichlet(old, concentration * new + 1) - log_dirichlet(new, concentration * old + 1)
+        return self.accept(proposal, hastings=hastings)  # Dirichlet(1) prior is uniform.
 
-    reverse_alpha = proposal_concentration * proposal + 1.0
-    log_q_forward = log_dirichlet_pdf(proposal, forward_alpha)
-    log_q_reverse = log_dirichlet_pdf(current, reverse_alpha)
-    log_acc = (
-        ll_prop + lp_prop + log_q_reverse
-        - ll_curr - lp_curr - log_q_forward
-    )
+    def background(self, b, step):
+        proposal = self.state.copy()
+        old = proposal.Gamma[b]
+        new = old * np.exp(step * self.rng.normal())
+        proposal.Gamma[b] = new
+        ratio = -(new**2 - old**2) / (2 * self.settings.background_prior_sd**2)
+        return self.accept(proposal, ratio, np.log(new / old))
 
-    if np.log(rng.uniform()) < log_acc:
-        return True
-    weights[cols_j] = current
-    return False
+    def shift(self, p, step):
+        if p < len(ISOTOPES) and not self.state.Z[p]:
+            self.state.theta[p] = self.rng.normal(0, self.settings.shift_prior_sd)
+            return False, False
+        broad = p >= len(ISOTOPES) and self.rng.uniform() < self.settings.broad_shift_probability
+        sd = self.settings.broad_shift_sd if broad else step
+        proposal = self.state.copy()
+        old = proposal.theta[p]
+        new = old + self.rng.normal(0, sd)
+        proposal.theta[p] = new
+        ratio = -(new**2 - old**2) / (2 * self.settings.shift_prior_sd**2)
+        # A state-independent mixture of symmetric random walks is symmetric.
+        return self.accept(proposal, ratio), broad
 
 
-# =============================================================================
-# INITIALIZATION
-# =============================================================================
-def init_random(K, B, iso_index, alpha_ig, beta_ig, pi, s_gamma, sigma_theta,
-                weight_dirichlet_alpha, rng, min_gamma=1e-6):
-    Z0 = rng.binomial(1, pi).astype(int)
-    A0 = np.zeros(K)
-    for j in range(K):
-        if Z0[j] == 1:
-            A0[j] = 1.0 / rng.gamma(shape=alpha_ig, scale=1.0 / beta_ig)
-    Gamma0 = np.clip(
-        np.abs(rng.normal(loc=0.0, scale=s_gamma, size=B)), min_gamma, None
-    )
-    weights0 = np.zeros(sum(len(cols_j) for cols_j in iso_index), dtype=float)
-    for cols_j in iso_index:
-        weights0[cols_j] = rng.dirichlet(
-            weight_dirichlet_alpha * np.ones(len(cols_j))
-        )
-    theta0 = rng.normal(loc=0.0, scale=sigma_theta, size=K + B)
-    return A0, weights0, Gamma0, theta0, Z0
+# Chains use distinct seeds and evenly spaced quantiles of the shift prior as
+# background starts. Per-parameter proposal adaptation stops at burn-in.
+def run_chain(model, base_state, settings, chain):
+    rng = np.random.default_rng(settings.seed + 1000 * chain)
+    state = base_state.copy()
+    k, b = len(ISOTOPES), len(state.Gamma)
+    if chain:
+        state.A *= np.exp(rng.normal(0, 0.01, k))
+        state.Gamma *= np.exp(rng.normal(0, 0.01, b))
+        state.theta[:k] += rng.normal(0, 0.002, k)
+        for group in model.groups:
+            if len(group) > 1:
+                state.weights[group] = rng.dirichlet(20000 * state.weights[group] + 1)
+    start_shift = settings.shift_prior_sd * norm.ppf((chain + 0.5) / settings.chains)
+    state.theta[k:] = start_shift
+    sampler = Sampler(model, state, settings, rng)
+    steps = dict(A=np.full(k, settings.log_activity_step), weights=np.full(k, settings.weight_concentration),
+        Gamma=np.full(b, settings.log_background_step),
+        theta=np.r_[np.full(k, settings.isotope_shift_step), np.full(b, settings.background_shift_step)])
+    warm = {name: np.zeros((2, len(step))) for name, step in steps.items()}
+    retained = {name: np.zeros((2, len(step))) for name, step in steps.items()}
+    count = settings.iterations - settings.burnin
+    samples = {name: np.zeros((count, len(getattr(state, name))), dtype=getattr(state, name).dtype)
+               for name in ("A", "weights", "Gamma", "theta", "Z")}
+    samples["loglik"] = np.zeros(count)
+    background_trace = np.zeros((settings.iterations, b))
+    broad_counts = np.zeros((2, 2), dtype=int)  # local/broad × attempts/acceptances
+    flip_counts = np.zeros(k, dtype=int)
+    for iteration in range(settings.iterations):
+        counters = warm if iteration < settings.burnin else retained
+        for j in range(k):
+            accepted = sampler.flip(j)
+            if iteration >= settings.burnin:
+                flip_counts[j] += accepted
+        for j in range(k):
+            if sampler.state.Z[j]:
+                accepted = sampler.activity(j, steps["A"][j])
+                counters["A"][:, j] += (1, accepted)
+        for j, group in enumerate(model.groups):
+            if len(group) > 1:
+                active = sampler.state.Z[j]
+                accepted = sampler.weights(j, steps["weights"][j])
+                if active:
+                    counters["weights"][:, j] += (1, accepted)
+        for background in range(b):
+            accepted = sampler.background(background, steps["Gamma"][background])
+            counters["Gamma"][:, background] += (1, accepted)
+        for p in range(k + b):
+            attempted = p >= k or sampler.state.Z[p]
+            accepted, broad = sampler.shift(p, steps["theta"][p])
+            if attempted:
+                counters["theta"][:, p] += (1, accepted)
+            if p >= k and iteration >= settings.burnin:
+                broad_counts[int(broad)] += (1, accepted)
+        if iteration < settings.burnin and (iteration + 1) % settings.adapt_interval == 0:
+            gain = 0.5 / np.sqrt((iteration + 1) / settings.adapt_interval)
+            for name, step in steps.items():
+                attempts, acceptances = warm[name]
+                active = attempts > 0
+                direction = -1 if name == "weights" else 1
+                step[active] *= np.exp(direction * gain * (acceptances[active] / attempts[active] - settings.target_acceptance))
+                low, high = (50, 1e6) if name == "weights" else (1e-5, 0.1 if name == "theta" else 0.2)
+                steps[name] = np.clip(step, low, high)
+                warm[name].fill(0)
+        background_trace[iteration] = sampler.state.theta[k:]
+        if iteration >= settings.burnin:
+            draw = iteration - settings.burnin
+            for name in ("A", "weights", "Gamma", "theta", "Z"):
+                samples[name][draw] = getattr(sampler.state, name)
+            samples["loglik"][draw] = sampler.ll
+        if (iteration + 1) % 5000 == 0:
+            print(f"  Chain {chain + 1}: {iteration + 1}/{settings.iterations}", flush=True)
+    return dict(samples=samples, background_shift_full=background_trace, start_shift=start_shift,
+        steps=steps, acceptance_counts=retained, background_proposal_counts=broad_counts,
+        inclusion_flips=flip_counts)
 
-# =============================================================================
-# SINGLE CHAIN RUNNER (with acceptance tracking)
-# =============================================================================
-def run_single_chain(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
-                     energy_template,
-                     alpha_ig, beta_ig, pi, s_gamma,
-                     sigma_theta, weight_dirichlet_alpha,
-                     weight_proposal_concentration,
-                     step_logA, step_gamma, step_theta,
-                     n_iter, burnin, seed, isotope_names=None,
-                     template_names=None,
-                     alignment_names=None, verbose=True, progress_every=1000):
 
-    rng = np.random.default_rng(seed)
-    K_local = len(iso_index)
-    M_local = len(F_iso_energy)
-    B_local = len(s_gamma)
-    P_local = K_local + B_local
+# Save posterior draws and chain diagnostics without interpreting [0,0] as
+# physical absence. Constant indicators have no meaningful R-hat or ESS.
+def summarize(values):
+    import arviz as az
+    flat = values.ravel()
+    row = dict(mean=float(flat.mean()), sd=float(flat.std(ddof=1)),
+        CI95_low=float(np.quantile(flat, .025)), CI95_high=float(np.quantile(flat, .975)),
+        Rhat=np.nan, ESS_bulk=np.nan, ESS_tail=np.nan)
+    if np.ptp(flat) > 0:
+        row.update(Rhat=float(az.rhat(values)), ESS_bulk=float(az.ess(values, method="bulk")),
+                   ESS_tail=float(az.ess(values, method="tail", prob=(.05, .95))))
+    return row
 
-    A0, weights, Gamma0, theta0, Z0 = init_random(
-        K=K_local, B=B_local, iso_index=iso_index,
-        alpha_ig=alpha_ig, beta_ig=beta_ig, pi=pi, s_gamma=s_gamma,
-        sigma_theta=sigma_theta,
-        weight_dirichlet_alpha=weight_dirichlet_alpha, rng=rng
-    )
-    theta = theta0.copy()
-    Z = Z0.copy()
 
-    if verbose:
-        print(f"\n=== Chain seed {seed} initial state ===")
-        if isotope_names is not None:
-            print(f"{'Isotope':30s}  {'A_init(kBq)':>12}  {'Z':>3}")
-            print("-" * 30)
-            for j, name in enumerate(isotope_names):
-                print(f"{name:30s}  {A0[j]/1e3:>12.4f}  {Z[j]:>3}")
-        if template_names is not None:
-            print("Weight_init:")
-            for m, name in enumerate(template_names):
-                print(f"  {name:34s}  {weights[m]:.5f}")
-        print(f"Gamma_init: {Gamma0}")
-        if alignment_names is not None:
-            theta_text = ", ".join(
-                f"{name}={theta[p]:.5f} keV"
-                for p, name in enumerate(alignment_names)
-            )
-            print(f"Theta_init: {theta_text}")
+def save_results(model, results, settings, output):
+    arrays = {name: np.stack([r["samples"][name] for r in results]) for name in results[0]["samples"]}
+    for name, values in arrays.items():
+        np.save(output / f"chains_{name}.npy", values)
+    alignment = np.r_[np.array(ISOTOPES), model.background_labels]
+    for name, values in dict(isotope_labels=ISOTOPES, template_labels=model.labels,
+        alignment_labels=alignment, energy_keV=model.energy, observed_counts=model.y,
+        interpolation_energy_keV=model.grid, interpolation_isotope_templates=model.templates,
+        interpolation_background_templates=model.backgrounds,
+        background_shift_full=np.stack([r["background_shift_full"] for r in results])).items():
+        np.save(output / f"{name}.npy", values)
+    rows, activities = [], []
+    for name, labels in [("A", ISOTOPES), ("Z", ISOTOPES), ("weights", model.labels),
+                         ("Gamma", model.background_labels), ("theta", alignment)]:
+        for j, label in enumerate(labels):
+            stats = summarize(arrays[name][:, :, j])
+            rows.append(dict(parameter=f"{name}_{label}", **stats))
+            if name == "A":
+                z = arrays["Z"][:, :, j]
+                activities.append(dict(isotope=label, PIP=float(z.mean()),
+                    included_draws=int(z.sum()),
+                    accepted_inclusion_flips=int(sum(r["inclusion_flips"][j] for r in results)), **stats,
+                    **{f"PIP_chain_{c+1}": float(z[c].mean()) for c in range(settings.chains)}))
+    rows.append(dict(parameter="loglik", **summarize(arrays["loglik"])))
+    diagnostics = pd.DataFrame(rows)
+    diagnostics["flag"] = (diagnostics.Rhat >= 1.01) | (diagnostics.ESS_bulk < 400)
+    # A nonconstant parameter with undefined diagnostics also needs attention.
+    diagnostics["flag"] |= (diagnostics.sd > 0) & (diagnostics.Rhat.isna() | diagnostics.ESS_bulk.isna())
+    diagnostics.to_csv(output / "parameter_diagnostics.csv", index=False)
+    activities = pd.DataFrame(activities)
+    activities.to_csv(output / "activity_summary.csv", index=False)
+    tuning = []
+    for c, result in enumerate(results):
+        for block, labels in [("A", ISOTOPES), ("weights", ISOTOPES),
+                              ("Gamma", model.background_labels), ("theta", alignment)]:
+            for j, label in enumerate(labels):
+                attempts, acceptances = result["acceptance_counts"][block][:, j]
+                tuning.append(dict(chain=c+1, parameter=f"{block}_{label}",
+                    final_proposal_scale=result["steps"][block][j], attempts=int(attempts),
+                    acceptances=int(acceptances), acceptance_rate=acceptances/attempts if attempts else np.nan))
+    pd.DataFrame(tuning).to_csv(output / "proposal_diagnostics.csv", index=False)
+    pd.DataFrame([dict(chain=c+1, proposal=label, attempts=int(counts[0]), acceptances=int(counts[1]))
+        for c, result in enumerate(results)
+        for label, counts in zip(("local", "broad"), result["background_proposal_counts"])
+    ]).to_csv(output / "background_proposal_diagnostics.csv", index=False)
+    flagged = diagnostics.loc[diagnostics.flag, "parameter"].tolist()
+    print(activities[["isotope", "PIP", "mean", "CI95_low", "CI95_high"]].to_string(index=False))
+    print("Diagnostics:", ", ".join(flagged) if flagged else "R-hat < 1.01 and bulk ESS >= 400 for nonconstant parameters")
+    if flagged:
+        print("Pooled summaries are provisional until the flagged chain diagnostics are resolved.")
+    return arrays, flagged
+
+
+# Compare activities with the documented G8 references after decay correction.
+# Alternative subset determinations are selected using the source-table notes,
+# never summed. E_n uses the 95% interval half-width and reference k=2 uncertainty.
+def compare_references(dataset, model, arrays, output):
+    table = pd.read_csv(dataset.directory / "021_A_REF_main.csv")
+    rows = table.loc[table.MeasurementSeriesID_613 == model.spectrum.series].copy()
+    g8 = rows.loc[rows.REF_type == "PeakAnalysis_G8"].copy()
+    g8["Subset"] = g8.Subset.fillna("")
+    notes = rows.Note.fillna("")
+    excluded = [subset for subset in g8.Subset.unique() if subset and
+                notes.str.contains(f"{subset} is not included", case=False, regex=False).any()]
+    g8 = g8.loc[~g8.Subset.isin(excluded)]
+    if g8.empty or g8.Nuclide.duplicated().any():
+        raise ValueError(f"No unique G8 reference selection for {model.spectrum.series}.")
+    half_lives = pd.read_csv(dataset.directory / "05_Half_lives.csv").set_index("Nuclide").HalfLife_s
+    comparisons = []
+    for _, row in g8.iterrows():
+        reference_date = pd.Timestamp(row.t_ref)
+        seconds = (reference_date - model.spectrum.start).total_seconds()
+        factor = np.exp(-np.log(2) * seconds / half_lives[row.Nuclide])
+        values = arrays["A"][:, :, ISOTOPES.index(row.Nuclide)] * factor
+        mean = float(values.mean())
+        low, high = np.quantile(values, [.025, .975])
+        comparisons.append(dict(isotope=row.Nuclide, reference_date=str(reference_date),
+            reference_Bq=row.A_Bq, reference_standard_uncertainty_Bq=row.uA_Bq,
+            subset=row.Subset, reference_file=row.REF_file, decay_factor=factor,
+            mean_at_reference_Bq=mean, CI95_low_Bq=low, CI95_high_Bq=high,
+            bias_percent=100 * (mean / row.A_Bq - 1),
+            En=(mean - row.A_Bq) / np.sqrt(((high - low) / 2)**2 + (2 * row.uA_Bq)**2)))
+    comparison = pd.DataFrame(comparisons)
+    comparison.to_csv(output / "reference_comparison_G8.csv", index=False)
+    print(comparison[["isotope", "bias_percent", "En"]].to_string(index=False))
+
+
+# Plot fitted counts and retained-chain traces. The mean fitted spectrum uses
+# up to 100 evenly spaced draws per chain; activity summaries use every draw.
+def plot_results(model, arrays, results, settings, output):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    means, backgrounds = [], []
+    for chain in range(settings.chains):
+        draws = np.linspace(0, arrays["A"].shape[1]-1, min(100, arrays["A"].shape[1]), dtype=int)
+        for draw in draws:
+            state = State(*(arrays[key][chain, draw] for key in ("A", "weights", "Gamma", "theta", "Z")))
+            means.append(model.expected_counts(state))
+            backgrounds.append(model.spectrum.livetime * sum(state.Gamma[b] * f(state.theta[len(ISOTOPES)+b])
+                               for b, f in enumerate(model.background_functions)))
+    mu, bg = np.mean(means, axis=0), np.mean(backgrounds, axis=0)
+    np.savez(output / "spectral_components.npz", energy_keV=model.energy, observed_counts=model.y,
+             posterior_mean_counts=mu, posterior_mean_background_counts=bg)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+    axes[0].plot(model.energy, model.y, color=".6", lw=.5, label="Observed")
+    axes[0].plot(model.energy, mu, lw=.7, label="Posterior mean fit")
+    axes[0].plot(model.energy, bg, lw=.7, label="Background")
+    axes[0].set(yscale="log", ylabel="Counts / channel", title=model.spectrum.filename)
+    axes[0].legend()
+    axes[1].plot(model.energy, (model.y-mu)/np.sqrt(mu), color=".4", lw=.5)
+    axes[1].axhline(0, color="k", lw=.5)
+    axes[1].set(xlabel="Energy (keV)", ylabel="Pearson residual", xlim=(settings.energy_min, settings.energy_max))
+    fig.tight_layout(); fig.savefig(output / "spectrum.png", dpi=160); plt.close(fig)
+    active = np.flatnonzero(arrays["Z"].mean(axis=(0, 1)) >= .5)
+    b = len(model.background_labels)
+    fig, axes = plt.subplots(len(active) + 2*b + 1, 1, figsize=(11, 2*(len(active)+2*b+1)))
+    traces = [(arrays["A"][:, :, j], f"{ISOTOPES[j]} activity (Bq)") for j in active]
+    traces += [(arrays["Gamma"][:, :, j], f"{label} scale") for j, label in enumerate(model.background_labels)]
+    traces += [(np.stack([r["background_shift_full"][:, j] for r in results]), f"{label} shift (keV)")
+               for j, label in enumerate(model.background_labels)]
+    traces += [(arrays["loglik"], "Log likelihood")]
+    for ax, (values, label) in zip(axes, traces):
+        full = values.shape[1] == settings.iterations
+        offset = 0 if full else settings.burnin
+        for chain in range(settings.chains):
+            ax.plot(np.arange(values.shape[1])+offset+1, values[chain], lw=.4, alpha=.7, label=f"Chain {chain+1}")
+        if full:
+            ax.axvline(settings.burnin, color="k", ls="--", lw=.8)
+        ax.set_ylabel(label)
+    axes[0].legend(ncol=settings.chains); axes[-1].set_xlabel("Iteration")
+    fig.tight_layout(); fig.savefig(output / "chain_traces.png", dpi=140); plt.close(fig)
+
+
+# Select one or all mixtures/runs and write each analysis to its own directory.
+# The command-line interface changes data selection and run length only.
+def main():
+    defaults = Settings()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--output-dir", type=Path, help="Default: data directory/results_updated/<timestamp>")
+    parser.add_argument("--mixture", default="849-23-P058-111", help="Measurement series ID or 'all'")
+    parser.add_argument("--run", default="1", help="One-based run number or 'all'")
+    parser.add_argument("--chains", type=int, default=defaults.chains)
+    parser.add_argument("--iterations", type=int, default=defaults.iterations)
+    parser.add_argument("--burnin", type=int, default=defaults.burnin)
+    parser.add_argument("--seed", type=int, default=defaults.seed)
+    parser.add_argument("--jobs", type=int, default=4)
+    args = parser.parse_args()
+    if args.chains < 2 or args.jobs < 1 or not 0 <= args.burnin < args.iterations - 3:
+        parser.error("Use at least two chains, positive jobs, and at least four retained iterations.")
+    settings = Settings(chains=args.chains, iterations=args.iterations, burnin=args.burnin, seed=args.seed)
+    output_root = args.output_dir or args.data_dir / "results_updated" / datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(output_root / ".matplotlib"))
+    dataset = Dataset(args.data_dir, settings)
+    series_ids = list(dataset.mixtures) if args.mixture == "all" else [args.mixture]
+    selections = []
+    for series in series_ids:
+        if series not in dataset.mixtures:
+            parser.error(f"Unknown mixture {series}; choose from {', '.join(dataset.mixtures)}")
+        filenames = dataset.mixtures[series]
+        try:
+            runs = list(range(1, len(filenames)+1)) if args.run == "all" else [int(args.run)]
+        except ValueError:
+            parser.error("--run must be a positive integer or 'all'.")
+        if any(run < 1 or run > len(filenames) for run in runs):
+            parser.error(f"{series} has {len(filenames)} runs, numbered from 1.")
+        selections += [(series, run, filenames[run-1]) for run in runs]
+    for series, run, filename in selections:
+        output = output_root / f"{series}_run{run}"
+        output.mkdir()  # Existing results are never silently overwritten.
+        start = time.perf_counter()
+        print(f"\n{series}, run {run}: {filename}", flush=True)
+        model = prepare_model(dataset, filename, settings, output)
+        state = initial_state(model, settings)
+        np.savez(output / "initial_state.npz", **asdict(state))
+        if args.jobs == 1:
+            results = [run_chain(model, state, settings, c) for c in range(settings.chains)]
         else:
-            print(f"Theta_init: {theta}")
-
-    samples_A      = np.zeros((n_iter, K_local))
-    samples_weights = np.zeros((n_iter, M_local))
-    samples_Gamma  = np.zeros((n_iter, B_local))
-    samples_theta  = np.zeros((n_iter, P_local))
-    samples_Z      = np.zeros((n_iter, K_local), dtype=int)
-    samples_loglik = np.zeros(n_iter)
-
-    # Acceptance counters (post-burn-in only)
-    acc_A     = np.zeros(K_local)
-    acc_weights = np.zeros(K_local)
-    acc_gamma = np.zeros(B_local)
-    acc_theta = np.zeros(P_local)
-    acc_Z     = np.zeros(K_local)
-    attempted_A = np.zeros(K_local, dtype=int)
-    attempted_weights = np.zeros(K_local, dtype=int)
-    attempted_gamma = np.zeros(B_local, dtype=int)
-    attempted_theta = np.zeros(P_local, dtype=int)
-    attempted_Z = np.zeros(K_local, dtype=int)
-
-    for it in range(n_iter):
-        for j in range(K_local):
-            if it >= burnin:
-                attempted_Z[j] += 1
-            accepted = int(mh_flip_Z_j(
-                j, Y0, A0, weights, Gamma0, theta, Z, T0,
-                alpha_ig, beta_ig, pi, F_iso_energy, F_bg_energy,
-                iso_index, energy_template, rng
-            ))
-            if it >= burnin:
-                acc_Z[j] += accepted
-        for j in range(K_local):
-            is_mh_attempt = Z[j] == 1 and A0[j] > 0
-            accepted = int(mh_update_A_j(
-                j, Y0, A0, weights, Gamma0, theta, Z, T0,
-                alpha_ig, beta_ig, F_iso_energy, F_bg_energy, step_logA,
-                iso_index, energy_template, rng
-            ))
-            if it >= burnin and is_mh_attempt:
-                attempted_A[j] += 1
-                acc_A[j] += accepted
-        for j in range(K_local):
-            is_mh_attempt = len(iso_index[j]) > 1 and Z[j] == 1
-            accepted = int(mh_update_weights_j(
-                j, Y0, A0, weights, Gamma0, theta, Z, T0,
-                weight_dirichlet_alpha, weight_proposal_concentration,
-                F_iso_energy, F_bg_energy, iso_index, energy_template, rng
-            ))
-            if it >= burnin and is_mh_attempt:
-                attempted_weights[j] += 1
-                acc_weights[j] += accepted
-        for b in range(B_local):
-            is_mh_attempt = Gamma0[b] > 0
-            accepted = int(mh_update_Gamma_b(
-                b, Y0, A0, weights, Gamma0, theta, Z, T0, s_gamma,
-                F_iso_energy, F_bg_energy, step_gamma, iso_index,
-                energy_template, rng
-            ))
-            if it >= burnin and is_mh_attempt:
-                attempted_gamma[b] += 1
-                acc_gamma[b] += accepted
-        for p in range(P_local):
-            is_mh_attempt = p >= K_local or Z[p] == 1
-            accepted = int(mh_update_theta_p(
-                p, Y0, A0, weights, Gamma0, theta, Z, T0, sigma_theta,
-                F_iso_energy, F_bg_energy, step_theta, iso_index,
-                energy_template, rng
-            ))
-            if it >= burnin and is_mh_attempt:
-                attempted_theta[p] += 1
-                acc_theta[p] += accepted
-
-        samples_A[it]      = A0
-        samples_weights[it] = weights
-        samples_Gamma[it]  = Gamma0
-        samples_theta[it]  = theta
-        samples_Z[it]      = Z
-        samples_loglik[it] = loglik(
-            Y0, A0, weights, Gamma0, theta, Z, T0,
-            F_iso_energy, F_bg_energy, iso_index, energy_template
-        )
-
-        if verbose and ((it + 1) % progress_every == 0 or it == n_iter - 1):
-            print(f"  Seed {seed}: iteration {it+1}/{n_iter}")
-
-    n_post = n_iter - burnin
-    def acceptance_rates(accepted, attempted):
-        return np.divide(
-            accepted, attempted,
-            out=np.zeros(accepted.shape, dtype=float),
-            where=attempted > 0,
-        )
-
-    rate_A = acceptance_rates(acc_A, attempted_A)
-    rate_weights = acceptance_rates(acc_weights, attempted_weights)
-    rate_gamma = acceptance_rates(acc_gamma, attempted_gamma)
-    rate_theta = acceptance_rates(acc_theta, attempted_theta)
-    rate_Z = acceptance_rates(acc_Z, attempted_Z)
-    if verbose:
-        print(f"\n  Acceptance rates (post burn-in, {n_post} samples):")
-        if isotope_names is not None:
-            print(
-                f"  {'Isotope':30s}  {'Z flip':>8}  {'A':>8}  "
-                f"{'Weights':>8}"
-            )
-            for j, name in enumerate(isotope_names):
-                print(f"  {name:30s}  {rate_Z[j]:>8.3f}  "
-                      f"{rate_A[j]:>8.3f}  "
-                      f"{rate_weights[j]:>8.3f}")
-        print(f"  Attempted Z: {attempted_Z}")
-        print(f"  Attempted A: {attempted_A}")
-        print(f"  Attempted weights: {attempted_weights}")
-        print(f"  Gamma: {rate_gamma.round(3)} (attempted {attempted_gamma})")
-        print(f"  Theta: {rate_theta.round(3)} (attempted {attempted_theta})")
-
-    return {
-        "A":         samples_A[burnin:],
-        "weights":   samples_weights[burnin:],
-        "Gamma":     samples_Gamma[burnin:],
-        "theta":     samples_theta[burnin:],
-        "Z":         samples_Z[burnin:],
-        "loglik":    samples_loglik[burnin:],
-        "acc_A": rate_A, "accepted_A": acc_A.astype(int),
-        "attempted_A": attempted_A,
-        "acc_weights": rate_weights, "accepted_weights": acc_weights.astype(int),
-        "attempted_weights": attempted_weights,
-        "acc_gamma": rate_gamma, "accepted_gamma": acc_gamma.astype(int),
-        "attempted_gamma": attempted_gamma,
-        "acc_theta": rate_theta, "accepted_theta": acc_theta.astype(int),
-        "attempted_theta": attempted_theta,
-        "acc_Z": rate_Z, "accepted_Z": acc_Z.astype(int),
-        "attempted_Z": attempted_Z,
-    }
-
-# =============================================================================
-# MULTI-CHAIN RUNNER
-# =============================================================================
-def run_multiple_chains(Y0, T0, F_iso_energy, F_bg_energy, iso_index,
-                        energy_template,
-                        alpha_ig, beta_ig, pi, s_gamma,
-                        sigma_theta, weight_dirichlet_alpha,
-                        weight_proposal_concentration,
-                        step_logA, step_gamma, step_theta,
-                        n_iter=4000, burnin=2000, n_chains=4,
-                        base_seed=123, isotope_names=None,
-                        template_names=None,
-                        alignment_names=None, verbose=True, progress_every=1000):
-
-    K_local = len(iso_index)
-    M_local = len(F_iso_energy)
-    B_local = len(s_gamma)
-    n_keep  = n_iter - burnin
-
-    chains_A      = np.zeros((n_chains, n_keep, K_local))
-    chains_weights = np.zeros((n_chains, n_keep, M_local))
-    chains_Gamma  = np.zeros((n_chains, n_keep, B_local))
-    chains_theta  = np.zeros((n_chains, n_keep, K_local + B_local))
-    chains_Z      = np.zeros((n_chains, n_keep, K_local), dtype=int)
-    chains_loglik = np.zeros((n_chains, n_keep))
-    acceptance = {
-        "A": np.zeros((n_chains, K_local)),
-        "weights": np.zeros((n_chains, K_local)),
-        "gamma": np.zeros((n_chains, B_local)),
-        "theta": np.zeros((n_chains, K_local + B_local)),
-        "Z": np.zeros((n_chains, K_local)),
-    }
-    attempted = {
-        name: np.zeros(values.shape, dtype=int)
-        for name, values in acceptance.items()
-    }
-    accepted = {
-        name: np.zeros(values.shape, dtype=int)
-        for name, values in acceptance.items()
-    }
-
-    for ch in range(n_chains):
-        seed = base_seed + 1000 * ch
-        out  = run_single_chain(
-            Y0=Y0, T0=T0, F_iso_energy=F_iso_energy,
-            F_bg_energy=F_bg_energy, iso_index=iso_index,
-            energy_template=energy_template,
-            alpha_ig=alpha_ig, beta_ig=beta_ig, pi=pi, s_gamma=s_gamma,
-            sigma_theta=sigma_theta,
-            weight_dirichlet_alpha=weight_dirichlet_alpha,
-            weight_proposal_concentration=weight_proposal_concentration,
-            step_logA=step_logA,
-            step_gamma=step_gamma, step_theta=step_theta,
-            n_iter=n_iter, burnin=burnin, seed=seed,
-            isotope_names=isotope_names, template_names=template_names,
-            alignment_names=alignment_names,
-            verbose=verbose,
-            progress_every=progress_every
-        )
-        chains_A[ch]      = out["A"]
-        chains_weights[ch] = out["weights"]
-        chains_Gamma[ch]  = out["Gamma"]
-        chains_theta[ch]  = out["theta"]
-        chains_Z[ch]      = out["Z"]
-        chains_loglik[ch] = out["loglik"]
-        for name in acceptance:
-            acceptance[name][ch] = out[f"acc_{name}"]
-            accepted[name][ch] = out[f"accepted_{name}"]
-            attempted[name][ch] = out[f"attempted_{name}"]
-
-    return {
-        "A": chains_A, "weights": chains_weights, "Gamma": chains_Gamma,
-        "theta": chains_theta,
-        "Z": chains_Z, "loglik": chains_loglik,
-        "acceptance": acceptance, "accepted": accepted, "attempted": attempted,
-    }
-
-# =============================================================================
-# RUN MCMC   timer wraps the full sampling block
-# =============================================================================
-n_chains = args.n_chains
-n_iter   = args.n_iter
-burnin   = args.burnin
-if n_chains < 1 or n_iter < 1 or not (0 <= burnin < n_iter):
-    raise ValueError(
-        "Require n_chains >= 1, n_iter >= 1, and 0 <= burnin < n_iter."
-    )
-
-print(f"\n{'='*60}")
-print(f"Starting MCMC: {n_chains} chains × {n_iter} iterations (burn-in {burnin})")
-print(f"{'='*60}")
-
-t_wall_start = time.time()
-
-multi_out = run_multiple_chains(
-    Y0=Y0, T0=T0, F_iso_energy=F_template_energy, F_bg_energy=F_bg_energy,
-    iso_index=model_iso_index, energy_template=energy_template,
-    alpha_ig=alpha_ig, beta_ig=beta_ig, pi=pi, s_gamma=s_gamma,
-    sigma_theta=sigma_theta,
-    weight_dirichlet_alpha=weight_dirichlet_alpha,
-    weight_proposal_concentration=weight_proposal_concentration,
-    step_logA=step_logA,
-    step_gamma=step_gamma, step_theta=step_theta,
-    n_iter=n_iter, burnin=burnin, n_chains=n_chains,
-    base_seed=123, isotope_names=model_isotope_names,
-    template_names=template_labels,
-    alignment_names=alignment_labels,
-    verbose=True,
-    progress_every=1000
-)
-
-elapsed = time.time() - t_wall_start
-h, rem  = divmod(int(elapsed), 3600)
-m, s    = divmod(rem, 60)
-print(f"\nTotal wall time: {h:02d}:{m:02d}:{s:02d}")
-
-# =============================================================================
-# SAVE CHAINS TO DISK
-# =============================================================================
-chains_A      = multi_out["A"]
-chains_weights = multi_out["weights"]
-chains_Gamma  = multi_out["Gamma"]
-chains_theta  = multi_out["theta"]
-chains_Z      = multi_out["Z"]
-chains_loglik = multi_out["loglik"]
-
-np.save(save_dir / "chains_A.npy",      chains_A)
-np.save(save_dir / "chains_weights.npy", chains_weights)
-np.save(save_dir / "chains_Gamma.npy",  chains_Gamma)
-np.save(save_dir / "chains_theta.npy",  chains_theta)
-np.save(save_dir / "chains_Z.npy",      chains_Z)
-np.save(save_dir / "chains_loglik.npy", chains_loglik)
-np.save(save_dir / "library_template_labels.npy", library_template_labels)
-np.save(save_dir / "template_labels.npy", template_labels)
-np.save(save_dir / "cluster_representative_templates.npy", X_template)
-np.save(
-    save_dir / "cluster_representative_candidate_indices.npy",
-    representative_candidate_idx,
-)
-np.save(save_dir / "background_representative_templates.npy", X_background)
-np.save(
-    save_dir / "background_representative_indices.npy",
-    background_representative_idx,
-)
-np.save(save_dir / "isotope_labels.npy", model_isotope_names)
-np.save(save_dir / "alignment_labels.npy", alignment_labels)
-np.save(save_dir / "energy_grid.npy", energy_template)
-
-acceptance_output = {}
-for name in multi_out["acceptance"]:
-    acceptance_output[f"rate_{name}"] = multi_out["acceptance"][name]
-    acceptance_output[f"accepted_{name}"] = multi_out["accepted"][name]
-    acceptance_output[f"attempted_{name}"] = multi_out["attempted"][name]
-np.savez(save_dir / "acceptance_diagnostics.npz", **acceptance_output)
-
-analysis_metadata = {
-    "schema_version": 1,
-    "data": {
-        "mixture_id": str(mix0["MSID"]),
-        "mixture_index": int(i_mix),
-        "run_index": int(r_run),
-        "run_filename": str(mix0["Filename"][r_run]),
-        "live_time_s": float(T0),
-        "energy_calibration": {
-            "b0_keV": float(a_cal),
-            "b1_keV_per_channel": float(b_cal),
-        },
-        "energy_grid_file": "energy_grid.npy",
-        "channel_count": int(C),
-    },
-    "model": {
-        "isotope_labels": model_isotope_names.tolist(),
-        "template_labels": template_labels.tolist(),
-        "background_labels": background_labels.tolist(),
-        "alignment_labels": alignment_labels.tolist(),
-        "isotope_template_indices": [
-            indices.tolist() for indices in model_iso_index
-        ],
-        "dimensions": {"K": int(K), "M": int(M), "B": int(B), "P": int(P)},
-        "priors": {
-            "activity_inverse_gamma": {
-                "alpha": float(alpha_ig), "beta_Bq": float(beta_ig)
-            },
-            "isotope_inclusion_probability": float(pi_iso_prior),
-            "shift_sigma_keV": float(sigma_theta),
-            "background_half_normal_scale": s_gamma.tolist(),
-            "weight_dirichlet_alpha": float(weight_dirichlet_alpha),
-        },
-        "clustering": {
-            "similarity_energy_keV": [
-                float(similarity_energy_min), float(similarity_energy_max)
-            ],
-            "template_cosine_threshold": float(cosine_cluster_threshold),
-            "template_pearson_threshold": float(pearson_cluster_threshold),
-            "background_cosine_threshold": float(background_cosine_threshold),
-            "background_pearson_threshold": float(background_pearson_threshold),
-            "template_representative_candidate_indices": (
-                representative_candidate_idx.tolist()
-            ),
-            "background_representative_indices": (
-                background_representative_idx.tolist()
-            ),
-        },
-        "proposals": {
-            "step_log_activity": step_logA.tolist(),
-            "step_background": step_gamma.tolist(),
-            "step_shift": step_theta.tolist(),
-            "weight_dirichlet_concentration": (
-                weight_proposal_concentration.tolist()
-            ),
-        },
-    },
-    "sampler": {
-        "n_chains": int(n_chains),
-        "n_iterations": int(n_iter),
-        "burnin": int(burnin),
-        "retained_draws_per_chain": int(n_iter - burnin),
-        "base_seed": 123,
-        "progress_every": 1000,
-    },
-}
-with (save_dir / "analysis_metadata.json").open("w", encoding="utf-8") as handle:
-    json.dump(analysis_metadata, handle, indent=2)
-print(f"Chains saved to: {save_dir}")
-
-# =============================================================================
-# POOL CHAINS
-# =============================================================================
-chains_A_iso = chains_A
-chains_Z_iso = chains_Z
-np.save(save_dir / "chains_A_iso.npy", chains_A_iso)
-np.save(save_dir / "chains_Z_iso.npy", chains_Z_iso)
-
-A_post          = chains_A.reshape(-1, K)
-weights_post    = chains_weights.reshape(-1, M)
-Gamma_post      = chains_Gamma.reshape(-1, B)
-theta_post      = chains_theta.reshape(-1, P)
-Z_post          = chains_Z.reshape(-1, K)
-
-A_post_kBq = A_post / 1e3
-incl_prob  = Z_post.mean(axis=0)
-
-print("\nPosterior inclusion probabilities — isotopes:")
-for j, lab in enumerate(model_isotope_names):
-    n_on  = int((Z_post[:, j] == 1).sum())
-    n_off = int((Z_post[:, j] == 0).sum())
-    print(
-        f"  {lab:6s}: P(Z=1|Y) = {incl_prob[j]:.4f}  "
-        f"(n_on={n_on}, n_off={n_off})"
-    )
-
-weight_summary_rows = []
-print("\nPosterior summaries — template-cluster weights:")
-for m, label in enumerate(template_labels):
-    mean_w = float(weights_post[:, m].mean())
-    lo_w, hi_w = np.percentile(weights_post[:, m], [2.5, 97.5])
-    isotope = model_isotope_names[iso_of_template_model[m]]
-    print(
-        f"  w[{isotope}, m={m:02d}] {label:34s}: "
-        f"mean={mean_w:.4f}, 95% CI=[{lo_w:.4f}, {hi_w:.4f}]"
-    )
-    weight_summary_rows.append({
-        "Cluster_index": m,
-        "Isotope": isotope,
-        "Template": label,
-        "Cluster_members": "; ".join(
-            candidate_template_labels[candidate_id]
-            for candidate_id in cluster_members[m]
-        ),
-        "Posterior_mean_weight": mean_w,
-        "Posterior_95CI_lo": lo_w,
-        "Posterior_95CI_hi": hi_w,
-    })
-weight_summary = pd.DataFrame(weight_summary_rows)
-weight_summary.to_csv(
-    save_dir / "posterior_template_weights.csv", index=False
-)
-print(
-    f"Template-weight table saved: "
-    f"{save_dir / 'posterior_template_weights.csv'}"
-)
-
-# =============================================================================
-# [2] CONVERGENCE DIAGNOSTICS: R-HAT AND ESS VIA ARVIZ
-# =============================================================================
-pip_threshold  = 0.5
-selected_idx   = np.where(incl_prob >= pip_threshold)[0]
-active_labels  = model_isotope_names[selected_idx]
-background_shift_idx = K + np.arange(B, dtype=int)
-diagnostic_weight_idx = np.array([
-    m for m in range(M)
-    if len(model_iso_index[iso_of_template_model[m]]) > 1
-], dtype=int)
-
-# Build ArviZ InferenceData — shape required: (n_chains, n_draws, ...)
-idata_dict = {
-    **{f"A_{model_isotope_names[j]}": chains_A_iso[:, :, j]
-       for j in selected_idx},
-    **{f"theta_{model_isotope_names[j]}": chains_theta[:, :, j]
-       for j in selected_idx},
-    **{f"w_m{m}": chains_weights[:, :, m]
-       for m in diagnostic_weight_idx},
-    **{f"theta_bg{b}": chains_theta[:, :, K + b] for b in range(B)},
-    **{f"gamma_{b}": chains_Gamma[:, :, b] for b in range(B)},
-}
-try:
-    idata = az.from_dict(posterior=idata_dict)
-except TypeError:
-    idata = az.from_dict({"posterior": idata_dict})
-
-print(f"\n{'='*60}")
-print("Convergence diagnostics (active isotopes, R-hat and ESS)")
-print(f"{'='*60}")
-print(f"{'Parameter':<18}  {'R-hat':>8}  {'ESS bulk':>10}  {'ESS tail':>10}  {'Status'}")
-print("-" * 60)
-for iso in active_labels:
-    var    = f"A_{iso}"
-    rhat   = float(az.rhat(idata)[var].values)
-    ess_b  = float(az.ess(idata, method="bulk")[var].values)
-    ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
-    print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
-
-# Isotope-specific energy shifts
-for j in selected_idx:
-    var    = f"theta_{model_isotope_names[j]}"
-    rhat   = float(az.rhat(idata)[var].values)
-    ess_b  = float(az.ess(idata, method="bulk")[var].values)
-    ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
-    print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
-
-# Retained-template nuisance weights
-for m in diagnostic_weight_idx:
-    var    = f"w_m{m}"
-    rhat   = float(az.rhat(idata)[var].values)
-    ess_b  = float(az.ess(idata, method="bulk")[var].values)
-    ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
-    print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
-
-# Background energy shifts
-for b in range(B):
-    var    = f"theta_bg{b}"
-    rhat   = float(az.rhat(idata)[var].values)
-    ess_b  = float(az.ess(idata, method="bulk")[var].values)
-    ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
-    print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
-
-# Background coefficients
-for b in range(B):
-    var    = f"gamma_{b}"
-    rhat   = float(az.rhat(idata)[var].values)
-    ess_b  = float(az.ess(idata, method="bulk")[var].values)
-    ess_t  = float(az.ess(idata, method="tail")[var].values)
-    status = "OK" if rhat < 1.01 and ess_b > 400 else "CHECK"
-    print(f"  {var:<16}  {rhat:>8.4f}  {ess_b:>10.1f}  {ess_t:>10.1f}  {status}")
-
-print(f"\nRule: R-hat < 1.01 and ESS > 400 indicate convergence.")
-
-# =============================================================================
-# POSTERIOR SUMMARIES
-# =============================================================================
-def summarize(name, samples, labels, scale=1.0, unit=""):
-    means  = samples.mean(axis=0) * scale
-    lower  = np.percentile(samples, 2.5,  axis=0) * scale
-    upper  = np.percentile(samples, 97.5, axis=0) * scale
-    for k, lab in enumerate(labels):
-        print(f"  {name} {lab:8s}: mean = {means[k]:.4g}{unit}, "
-              f"95% CI = [{lower[k]:.4g}, {upper[k]:.4g}]{unit}")
-
-print("\nPosterior summaries — activities (kBq):")
-summarize("A", A_post, model_isotope_names, scale=1e-3, unit=" kBq")
-
-print("\nPosterior summaries — background coefficients:")
-summarize("γ", Gamma_post, ["total"])
-
-print("\nPosterior summaries — isotope-specific energy shifts:")
-summarize(
-    "θ", theta_post[:, selected_idx],
-    model_isotope_names[selected_idx], unit=" keV"
-)
-
-print("\nPosterior summaries — background energy shifts:")
-summarize(
-    "θ", theta_post[:, background_shift_idx], background_shift_labels,
-    unit=" keV"
-)
-
-# =============================================================================
-# REFERENCE ACTIVITY COMPARISON — PEAKANALYSIS_G8 FROM FILE 021
-# =============================================================================
-
-
-def select_peakanalysis_g8_rows(reference_table, measurement_series_id):
-    """Select one unambiguous PeakAnalysis_G8 reference per isotope.
-
-    Some measurement series contain alternative subset-specific G8
-    determinations of the same activity. These are not additive components.
-    When file 021 explicitly marks a subset as "is not included", that subset
-    is excluded. Any remaining ambiguity raises an error rather than silently
-    summing or averaging distinct reference determinations.
-    """
-    required_columns = [
-        "MeasurementSeriesID_613", "REF_type", "Subset", "Nuclide",
-        "t_ref", "A_Bq", "uA_Bq", "REF_file", "Note",
-    ]
-    missing_columns = [
-        column for column in required_columns
-        if column not in reference_table.columns
-    ]
-    if missing_columns:
-        raise ValueError(
-            "021_A_REF_main.csv is missing required columns: "
-            f"{missing_columns}."
-        )
-
-    series_id = str(measurement_series_id)
-    series_rows = reference_table.loc[
-        reference_table["MeasurementSeriesID_613"].astype(str).eq(series_id)
-    ].copy()
-    if series_rows.empty:
-        raise ValueError(
-            f"No reference rows found in 021_A_REF_main.csv for {series_id}."
-        )
-
-    g8_rows = series_rows.loc[
-        series_rows["REF_type"].astype(str).eq("PeakAnalysis_G8")
-    ].copy()
-    if g8_rows.empty:
-        raise ValueError(
-            f"No PeakAnalysis_G8 references found in 021_A_REF_main.csv "
-            f"for {series_id}."
-        )
-
-    required_values = ["Nuclide", "t_ref", "A_Bq", "uA_Bq", "REF_file"]
-    if g8_rows[required_values].isna().any().any():
-        raise ValueError(
-            f"Incomplete PeakAnalysis_G8 reference data for {series_id}."
-        )
-    g8_rows["Subset"] = g8_rows["Subset"].fillna("").astype(str).str.strip()
-    g8_rows["Nuclide"] = g8_rows["Nuclide"].astype(str).str.strip()
-    g8_rows["REF_file"] = g8_rows["REF_file"].astype(str).str.strip()
-    g8_rows["A_Bq"] = pd.to_numeric(g8_rows["A_Bq"], errors="raise")
-    g8_rows["uA_Bq"] = pd.to_numeric(g8_rows["uA_Bq"], errors="raise")
-    g8_rows["t_ref"] = pd.to_datetime(g8_rows["t_ref"], errors="raise")
-
-    if (g8_rows["Nuclide"].eq("").any() or g8_rows["REF_file"].eq("").any()):
-        raise ValueError(
-            f"Incomplete PeakAnalysis_G8 reference data for {series_id}."
-        )
-    if np.any(~np.isfinite(g8_rows["A_Bq"])) or np.any(g8_rows["A_Bq"] <= 0):
-        raise ValueError(f"Invalid PeakAnalysis_G8 activities for {series_id}.")
-    if np.any(~np.isfinite(g8_rows["uA_Bq"])) or np.any(g8_rows["uA_Bq"] < 0):
-        raise ValueError(
-            f"Invalid PeakAnalysis_G8 standard uncertainties for {series_id}."
-        )
-    if g8_rows.duplicated(["Nuclide", "Subset", "REF_file"]).any():
-        raise ValueError(
-            f"Duplicate PeakAnalysis_G8 rows found for {series_id}."
-        )
-
-    notes = series_rows["Note"].fillna("").astype(str)
-    subset_names = sorted(set(g8_rows["Subset"]) - {""})
-    excluded_subsets = {
-        subset for subset in subset_names
-        if notes.str.contains(
-            f"{subset} is not included", case=False, regex=False
-        ).any()
-    }
-
-    selected_rows = []
-    for isotope, isotope_rows in g8_rows.groupby("Nuclide", sort=False):
-        eligible = isotope_rows.loc[
-            ~isotope_rows["Subset"].isin(excluded_subsets)
-        ]
-        if len(eligible) != 1:
-            candidates = isotope_rows[
-                ["Subset", "REF_file", "A_Bq", "uA_Bq"]
-            ].to_dict("records")
-            raise ValueError(
-                f"Could not select one PeakAnalysis_G8 reference for "
-                f"{series_id}, isotope {isotope}. Candidates: {candidates}; "
-                f"subsets explicitly excluded by file 021: "
-                f"{sorted(excluded_subsets)}. Add an explicit selection to "
-                "021_A_REF_main.csv; G8 subset activities must not be summed."
-            )
-        selected_rows.append(eligible.iloc[0])
-
-    selected = pd.DataFrame(selected_rows).reset_index(drop=True)
-    if selected["Nuclide"].duplicated().any():
-        raise ValueError(
-            f"PeakAnalysis_G8 selection is not unique for {series_id}."
-        )
-    return selected, sorted(excluded_subsets)
-
-
-reference_table = pd.read_csv(base / "021_A_REF_main.csv")
-g8_rows, excluded_g8_subsets = select_peakanalysis_g8_rows(
-    reference_table, mix0["MSID"]
-)
-
-reference_dates = g8_rows["t_ref"].drop_duplicates()
-if len(reference_dates) != 1:
-    raise ValueError(
-        f"PeakAnalysis_G8 rows for {mix0['MSID']} do not share one "
-        f"reference date: {reference_dates.astype(str).tolist()}"
-    )
-reference_date = pd.Timestamp(reference_dates.iloc[0])
-
-g8_reference = {}
-for _, row in g8_rows.iterrows():
-    iso = str(row["Nuclide"])
-    g8_reference[iso] = {
-        "A_Bq": float(row["A_Bq"]),
-        "uA_Bq": float(row["uA_Bq"]),
-        "subset": str(row["Subset"]),
-        "reference_file": str(row["REF_file"]),
-    }
-
-expected_g8_isotopes = set(
-    tmls.loc[
-        tmls["MeasurementSeriesID_613"].astype(str).eq(str(mix0["MSID"])),
-        "Nuclide",
-    ].dropna().astype(str)
-)
-if set(g8_reference) != expected_g8_isotopes:
-    raise ValueError(
-        f"PeakAnalysis_G8 isotope mismatch for {mix0['MSID']}: expected "
-        f"{sorted(expected_g8_isotopes)}, found {sorted(g8_reference)}."
-    )
-
-run_filename = str(mix0["Filename"][r_run])
-run_rows = spectra.loc[spectra["Filename"].astype(str).eq(run_filename)]
-if len(run_rows) != 1:
-    raise ValueError(
-        f"Expected one spectrum row for selected run {run_filename}; "
-        f"found {len(run_rows)}."
-    )
-run_start = pd.to_datetime(run_rows["t_start"].iloc[0], errors="raise")
-elapsed_seconds_to_reference = (reference_date - run_start).total_seconds()
-
-half_lives = pd.read_csv(base / "05_Half_lives.csv")
-if half_lives["Nuclide"].astype(str).duplicated().any():
-    raise ValueError("05_Half_lives.csv contains duplicate nuclide rows.")
-half_life_seconds = dict(zip(
-    half_lives["Nuclide"].astype(str), half_lives["HalfLife_s"].astype(float)
-))
-missing_half_lives = sorted(set(g8_reference) - set(half_life_seconds))
-invalid_half_lives = sorted(
-    iso for iso in g8_reference
-    if iso in half_life_seconds and (
-        not np.isfinite(half_life_seconds[iso]) or half_life_seconds[iso] <= 0
-    )
-)
-if missing_half_lives or invalid_half_lives:
-    raise ValueError(
-        f"Invalid half-life lookup. Missing: {missing_half_lives}; "
-        f"nonpositive/nonfinite: {invalid_half_lives}."
-    )
-iso_idx = {name: i for i, name in enumerate(model_isotope_names)}
-unknown_g8_isotopes = sorted(set(g8_reference) - set(iso_idx))
-if unknown_g8_isotopes:
-    raise ValueError(
-        f"PeakAnalysis_G8 contains isotopes outside the candidate model: "
-        f"{unknown_g8_isotopes}"
-    )
-
-comparison_width = 93
-print(f"\n{'='*comparison_width}")
-print(f"PeakAnalysis_G8 comparison — mixture {i_mix}, run {r_run}: {run_filename}")
-print(f"G8 references loaded from 021_A_REF_main.csv for {mix0['MSID']}")
-selected_subsets = sorted(
-    {ref["subset"] for ref in g8_reference.values() if ref["subset"]}
-)
-if selected_subsets:
-    print(f"Selected G8 subset(s): {', '.join(selected_subsets)}")
-if excluded_g8_subsets:
-    print(
-        "Excluded G8 subset(s) marked 'is not included' in file 021: "
-        f"{', '.join(excluded_g8_subsets)}"
-    )
-print(f"Posterior activities decay-corrected from {run_start} to {reference_date}")
-print(f"{'='*comparison_width}")
-print(f"{'Isotope':<8} {'Post.Mean':>10} {'99% CI (kBq)':>22} "
-      f"{'G8 (kBq)':>10} {'uG8':>8} "
-      f"{'Bias%':>8} {'En':>8} {'Cover99':>7}")
-print("-" * comparison_width)
-
-comparison_rows = []
-for iso, ref in g8_reference.items():
-    j = iso_idx[iso]
-    decay_factor = np.exp(
-        -np.log(2.0) * elapsed_seconds_to_reference / half_life_seconds[iso]
-    )
-    posterior_at_reference = A_post[:, j] * decay_factor
-    pm_Bq = posterior_at_reference.mean()
-    lo_Bq, hi_Bq = np.percentile(posterior_at_reference, [2.5, 97.5])
-    lo99_Bq, hi99_Bq = np.percentile(posterior_at_reference, [0.5, 99.5])
-    U_post_Bq = (hi_Bq - lo_Bq) / 2.0
-
-    A_ref = ref["A_Bq"]
-    uA_ref = ref["uA_Bq"]
-    U_ref_Bq = 2.0 * uA_ref
-    rel_bias = (pm_Bq - A_ref) / A_ref * 100.0
-    En = (pm_Bq - A_ref) / np.sqrt(U_post_Bq**2 + U_ref_Bq**2)
-    covered = lo99_Bq <= A_ref <= hi99_Bq
-
-    print(f"{iso:<8} {pm_Bq/1e3:>10.4f} "
-          f"[{lo99_Bq/1e3:.4f}, {hi99_Bq/1e3:.4f}] "
-          f"{A_ref/1e3:>10.4f} {uA_ref/1e3:>8.4f} "
-          f"{rel_bias:>8.2f} {En:>8.3f} {str(covered):>7}")
-
-    comparison_rows.append({
-        "Filename": run_filename,
-        "Reference_date": reference_date,
-        "Isotope": iso,
-        "Decay_factor_to_reference": decay_factor,
-        "Post_mean_kBq": pm_Bq / 1e3,
-        "CI99_lo_kBq": lo99_Bq / 1e3,
-        "CI99_hi_kBq": hi99_Bq / 1e3,
-        "PIP": incl_prob[j],
-        "Reference_type": "PeakAnalysis_G8",
-        "Ref_G8_kBq": A_ref / 1e3,
-        "uRef_G8_k1_kBq": uA_ref / 1e3,
-        "G8_component_count": 1,
-        "G8_subset": ref["subset"],
-        "G8_reference_files": ref["reference_file"],
-        "Rel_bias_pct": rel_bias,
-        "En": En,
-        "Covered_99pct": covered,
-    })
-
-df_comp = pd.DataFrame(comparison_rows)
-df_comp.to_csv(save_dir / "reference_comparison_G8.csv", index=False)
-print(f"\nComparison table saved: {save_dir / 'reference_comparison_G8.csv'}")
-
-# =============================================================================
-# PLOTTING
-# =============================================================================
-# Figures are generated from the saved posterior draws by plotting.py. This
-# keeps plotting changes independent of the MCMC run.
-print(f"\n{'='*60}")
-print(f"All numerical outputs saved to: {save_dir}")
-print("Run plotting.py to generate or update figures from these chains.")
-print(f"{'='*60}")
+            with ProcessPoolExecutor(max_workers=min(args.jobs, settings.chains),
+                                     mp_context=multiprocessing.get_context("spawn")) as pool:
+                futures = [pool.submit(run_chain, model, state, settings, c) for c in range(settings.chains)]
+                results = [future.result() for future in futures]
+        arrays, flags = save_results(model, results, settings, output)
+        compare_references(dataset, model, arrays, output)
+        plot_results(model, arrays, results, settings, output)
+        metadata = dict(settings=asdict(settings), measurement_series=series, run=run, filename=filename,
+            livetime_s=model.spectrum.livetime, background_series=list(dataset.backgrounds),
+            shift_starts_keV=[r["start_shift"] for r in results],
+            initialization="Nonnegative weighted spectral fit with equal template weights; all inclusion indicators start on",
+            diagnostic_flags=flags, wall_seconds=time.perf_counter()-start,
+            interpretation="Inspect chain diagnostics. [0,0] does not establish absence; L_D is a background-only count benchmark, not an isotope-specific detection guarantee.")
+        (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        print(f"Saved {output} ({metadata['wall_seconds']:.1f} s)", flush=True)
+
+
+if __name__ == "__main__":
+    main()

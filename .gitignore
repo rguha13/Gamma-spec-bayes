@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 venv/
 results/
+results_updated/
 Spectra_plots/
 
 # Wübbeler et al. data files are obtained separately

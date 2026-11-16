@@ -28,28 +28,25 @@ where:
   nonnegative scale, and energy shift.
 
 The isotope library contains 31 candidate template series for 11 radionuclides.
-Within each isotope, near-duplicate templates are clustered over 20--1500 keV
-when both cosine similarity and Pearson correlation are at least 0.999. The
-first template in each cluster is retained. For the supplied dataset this
-reduces the library from 31 candidates to 18 representatives. The two
-background series are screened with the same criteria and reduce to one
-representative background component.
+The sampler estimates the nonnegative source response of each calibration run
+after subtracting the estimated background count rate, then normalizes by
+reference activity. It fits the observed mixture counts over 20–2800 keV.
+Within each isotope, templates are clustered using cosine similarity and
+Pearson correlation (threshold 0.999 for both). In the manuscript example,
+19 isotope templates and one empirical background component are retained.
 
-The priors used by the final analysis are:
+Each isotope has prior inclusion probability 0.5 and a point mass at zero
+when excluded. Given inclusion, its activity follows an inverse-gamma prior
+with shape 2.5. The scale is set separately for each isotope so that the
+background-based activity benchmark is the 0.5th percentile of the slab.
+The benchmark uses the background measurements, sample livetime, and
+retained template responses. The sampler uses uniform Dirichlet template
+weights, zero-centered normal energy shifts (SD 0.5 keV), and half-normal
+background scaling coefficients (scale 0.5).
 
-```text
-Z_j ~ Bernoulli(0.5)
-A_j | Z_j = 1 ~ Inverse-Gamma(alpha=2.5, beta=1500 Bq)
-A_j | Z_j = 0 = 0
-w_j ~ Dirichlet(1, ..., 1)
-theta_j, phi_b ~ Normal(0, 0.5^2 keV^2)
-gamma_b ~ Half-Normal(0.5)
-```
-
-Posterior inference uses a custom Metropolis-Hastings sampler. The default
-run uses four chains of 20,000 iterations with the first 5,000 iterations of
-each chain discarded as burn-in. The number of MCMC iterations and burn-in period may be increased
-if the sampler hasn't converged within the default configurations.
+The default run uses four Metropolis–Hastings chains of 20,000 iterations
+each and discards the first 10,000 per chain. The background shift uses both
+local and broader proposals, with distinct initial shifts across chains.
 
 ## Files
 
@@ -88,51 +85,41 @@ python -m pip install -r requirements.txt
 
 ## Run the analysis
 
-The manuscript example uses measurement series `849-23-P058-111`, Python run
-index `0` (`849-23-P058-001.cnf`). It is selected by the default mixture and run
-indices:
+The manuscript example is run **1** of measurement series
+`849-23-P058-111` (`849-23-P058-001.cnf`). Run numbers start at 1.
 
 ```bash
-python gamma_spec_bayes.py --data-dir /path/to/data
+python gamma_spec_bayes.py --data-dir /path/to/data --mixture 849-23-P058-111 --run 1
 ```
 
-For a quick execution check:
+For all spectra from all four mixtures:
 
 ```bash
-python gamma_spec_bayes.py --data-dir /path/to/data \
-  --n-chains 2 --n-iter 200 --burnin 100
+python gamma_spec_bayes.py --data-dir /path/to/data --mixture all --run all
 ```
 
-Any available mixture and run can be selected explicitly:
+The sampler writes one directory per spectrum under
+`<data-dir>/results_updated/<timestamp>/`. Use `--output-dir` to choose a
+different batch directory. Outputs include the retained draws, posterior
+summaries, template clusters, detection benchmark, isotope-specific priors,
+convergence diagnostics and comparison with the G8 reference activities.
+
+## Regenerate manuscript figures and tables
+
+Supply the representative spectrum's saved directory and the original input
+directory to export figures as PDF and PNG and tables as CSV. Replace
+`TIMESTAMP` with the directory name printed by the sampler.
 
 ```bash
-python gamma_spec_bayes.py --data-dir /path/to/data \
-  --mixture-index 1 --run-index 0
+python plotting.py --data-dir /path/to/data --results-dir /path/to/data/results_updated/TIMESTAMP/849-23-P058-111_run1
 ```
 
-Numerical outputs and retained posterior chains are written under
-`<data-dir>/results` by default. Use `--output-dir` to choose another location.
-
-## Regenerate figures
-
-After the sampler has saved its chains, figures can be regenerated without
-rerunning MCMC:
+To report aggregate relative bias, normalized error and isotope selection
+from a batch, supply its parent directory:
 
 ```bash
-python plotting.py --data-dir /path/to/data --mixture 1 --run 0
+python plotting.py --aggregate-root /path/to/data/results_updated/TIMESTAMP
 ```
-
-Use `--results-dir` if the saved chains are in a non-default location.
-
-## Principal outputs
-
-The output directory contains the retained chains for activities, inclusion
-indicators, template weights, background coefficients, and energy shifts;
-template and background cluster assignments; convergence diagnostics printed
-to the terminal; accepted and attempted proposal counts; run/model metadata and
-the saved energy grid used to validate later plotting; posterior summaries; the
-PeakAnalysis_G8 reference comparison; and the reconstructed-spectrum and
-posterior figures.
 
 ## Citation
 
